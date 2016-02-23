@@ -984,7 +984,7 @@ public:
     //!@name Bool
     //@{
 
-    bool GetBool() const { RAPIDJSON_ASSERT(IsBool()); return data_.f.flags == kTrueFlag; }
+    bool GetBool() const { RAPIDJSON_TEST_TYPE(IsBool(), "Bool", *this); return data_.f.flags == kTrueFlag; }
     //!< Set boolean value
     /*! \post IsBool() == true */
     GenericValue& SetBool(bool b) { this->~GenericValue(); new (this) GenericValue(b); return *this; }
@@ -999,10 +999,10 @@ public:
     GenericValue& SetObject() { this->~GenericValue(); new (this) GenericValue(kObjectType); return *this; }
 
     //! Get the number of members in the object.
-    SizeType MemberCount() const { RAPIDJSON_ASSERT(IsObject()); return data_.o.size; }
+    SizeType MemberCount() const { RAPIDJSON_TEST_TYPE(IsObject(), "Object", *this); return data_.o.size; }
 
     //! Check whether the object is empty.
-    bool ObjectEmpty() const { RAPIDJSON_ASSERT(IsObject()); return data_.o.size == 0; }
+    bool ObjectEmpty() const { RAPIDJSON_TEST_TYPE(IsObject(), "Object", *this); return data_.o.size == 0; }
 
     //! Get a value from an object associated with the name.
     /*! \pre IsObject() == true
@@ -1036,7 +1036,7 @@ public:
         if (member != MemberEnd())
             return member->value;
         else {
-            RAPIDJSON_ASSERT(false);    // see above note
+	  RAPIDJSON_GET_VALUE_FAILURE(name); // see above note
 
             // This will generate -Wexit-time-destructors in clang
             // static GenericValue NullValue;
@@ -1058,16 +1058,16 @@ public:
 
     //! Const member iterator
     /*! \pre IsObject() == true */
-    ConstMemberIterator MemberBegin() const { RAPIDJSON_ASSERT(IsObject()); return ConstMemberIterator(GetMembersPointer()); }
+    ConstMemberIterator MemberBegin() const { RAPIDJSON_TEST_TYPE(IsObject(), "Object", *this); return ConstMemberIterator(GetMembersPointer()); }
     //! Const \em past-the-end member iterator
     /*! \pre IsObject() == true */
-    ConstMemberIterator MemberEnd() const   { RAPIDJSON_ASSERT(IsObject()); return ConstMemberIterator(GetMembersPointer() + data_.o.size); }
+    ConstMemberIterator MemberEnd() const   { RAPIDJSON_TEST_TYPE(IsObject(), "Object", *this); return ConstMemberIterator(GetMembersPointer() + data_.o.size); }
     //! Member iterator
     /*! \pre IsObject() == true */
-    MemberIterator MemberBegin()            { RAPIDJSON_ASSERT(IsObject()); return MemberIterator(GetMembersPointer()); }
+    MemberIterator MemberBegin()            { RAPIDJSON_TEST_TYPE(IsObject(), "Object", *this); return MemberIterator(GetMembersPointer()); }
     //! \em Past-the-end member iterator
     /*! \pre IsObject() == true */
-    MemberIterator MemberEnd()              { RAPIDJSON_ASSERT(IsObject()); return MemberIterator(GetMembersPointer() + data_.o.size); }
+    MemberIterator MemberEnd()              { RAPIDJSON_TEST_TYPE(IsObject(), "Object", *this); return MemberIterator(GetMembersPointer() + data_.o.size); }
 
     //! Check whether a member exists in the object.
     /*!
@@ -1137,7 +1137,7 @@ public:
     */
     template <typename SourceAllocator>
     MemberIterator FindMember(const GenericValue<Encoding, SourceAllocator>& name) {
-        RAPIDJSON_ASSERT(IsObject());
+        RAPIDJSON_TEST_TYPE(IsObject(), "Object", *this);
         RAPIDJSON_ASSERT(name.IsString());
         MemberIterator member = MemberBegin();
         for ( ; member != MemberEnd(); ++member)
@@ -1170,7 +1170,7 @@ public:
         \note Amortized Constant time complexity.
     */
     GenericValue& AddMember(GenericValue& name, GenericValue& value, Allocator& allocator) {
-        RAPIDJSON_ASSERT(IsObject());
+        RAPIDJSON_TEST_TYPE(IsObject(), "Object", *this);
         RAPIDJSON_ASSERT(name.IsString());
 
         ObjectData& o = data_.o;
@@ -1321,7 +1321,7 @@ public:
         \note Linear time complexity.
     */
     void RemoveAllMembers() {
-        RAPIDJSON_ASSERT(IsObject()); 
+        RAPIDJSON_TEST_TYPE(IsObject(), "Object", *this); 
         for (MemberIterator m = MemberBegin(); m != MemberEnd(); ++m)
             m->~Member();
         data_.o.size = 0;
@@ -1364,7 +1364,7 @@ public:
         \note Constant time complexity.
     */
     MemberIterator RemoveMember(MemberIterator m) {
-        RAPIDJSON_ASSERT(IsObject());
+        RAPIDJSON_TEST_TYPE(IsObject(), "Object", *this);
         RAPIDJSON_ASSERT(data_.o.size > 0);
         RAPIDJSON_ASSERT(GetMembersPointer() != 0);
         RAPIDJSON_ASSERT(m >= MemberBegin() && m < MemberEnd());
@@ -1401,7 +1401,7 @@ public:
         \note Linear time complexity.
     */
     MemberIterator EraseMember(ConstMemberIterator first, ConstMemberIterator last) {
-        RAPIDJSON_ASSERT(IsObject());
+        RAPIDJSON_TEST_TYPE(IsObject(), "Object", *this);
         RAPIDJSON_ASSERT(data_.o.size > 0);
         RAPIDJSON_ASSERT(GetMembersPointer() != 0);
         RAPIDJSON_ASSERT(first >= MemberBegin());
@@ -1441,8 +1441,8 @@ public:
             return false;
     }
 
-    Object GetObject() { RAPIDJSON_ASSERT(IsObject()); return Object(*this); }
-    ConstObject GetObject() const { RAPIDJSON_ASSERT(IsObject()); return ConstObject(*this); }
+    Object GetObject() { RAPIDJSON_TEST_TYPE(IsObject(), "Object", *this); return Object(*this); }
+    ConstObject GetObject() const { RAPIDJSON_TEST_TYPE(IsObject(), "Object", *this); return ConstObject(*this); }
 
     //@}
 
@@ -1454,20 +1454,20 @@ public:
     GenericValue& SetArray() { this->~GenericValue(); new (this) GenericValue(kArrayType); return *this; }
 
     //! Get the number of elements in array.
-    SizeType Size() const { RAPIDJSON_ASSERT(IsArray()); return data_.a.size; }
+    SizeType Size() const { RAPIDJSON_TEST_TYPE(IsArray(), "Array", *this); return data_.a.size; }
 
     //! Get the capacity of array.
-    SizeType Capacity() const { RAPIDJSON_ASSERT(IsArray()); return data_.a.capacity; }
+    SizeType Capacity() const { RAPIDJSON_TEST_TYPE(IsArray(), "Array", *this); return data_.a.capacity; }
 
     //! Check whether the array is empty.
-    bool Empty() const { RAPIDJSON_ASSERT(IsArray()); return data_.a.size == 0; }
+    bool Empty() const { RAPIDJSON_TEST_TYPE(IsArray(), "Array", *this); return data_.a.size == 0; }
 
     //! Remove all elements in the array.
     /*! This function do not deallocate memory in the array, i.e. the capacity is unchanged.
         \note Linear time complexity.
     */
     void Clear() {
-        RAPIDJSON_ASSERT(IsArray()); 
+        RAPIDJSON_TEST_TYPE(IsArray(), "Array", *this); 
         GenericValue* e = GetElementsPointer();
         for (GenericValue* v = e; v != e + data_.a.size; ++v)
             v->~GenericValue();
@@ -1480,7 +1480,7 @@ public:
         \see operator[](T*)
     */
     GenericValue& operator[](SizeType index) {
-        RAPIDJSON_ASSERT(IsArray());
+        RAPIDJSON_TEST_TYPE(IsArray(), "Array", *this);
         RAPIDJSON_ASSERT(index < data_.a.size);
         return GetElementsPointer()[index];
     }
@@ -1488,10 +1488,10 @@ public:
 
     //! Element iterator
     /*! \pre IsArray() == true */
-    ValueIterator Begin() { RAPIDJSON_ASSERT(IsArray()); return GetElementsPointer(); }
+    ValueIterator Begin() { RAPIDJSON_TEST_TYPE(IsArray(), "Array", *this); return GetElementsPointer(); }
     //! \em Past-the-end element iterator
     /*! \pre IsArray() == true */
-    ValueIterator End() { RAPIDJSON_ASSERT(IsArray()); return GetElementsPointer() + data_.a.size; }
+    ValueIterator End() { RAPIDJSON_TEST_TYPE(IsArray(), "Array", *this); return GetElementsPointer() + data_.a.size; }
     //! Constant element iterator
     /*! \pre IsArray() == true */
     ConstValueIterator Begin() const { return const_cast<GenericValue&>(*this).Begin(); }
@@ -1506,7 +1506,7 @@ public:
         \note Linear time complexity.
     */
     GenericValue& Reserve(SizeType newCapacity, Allocator &allocator) {
-        RAPIDJSON_ASSERT(IsArray());
+        RAPIDJSON_TEST_TYPE(IsArray(), "Array", *this);
         if (newCapacity > data_.a.capacity) {
             SetElementsPointer(reinterpret_cast<GenericValue*>(allocator.Realloc(GetElementsPointer(), data_.a.capacity * sizeof(GenericValue), newCapacity * sizeof(GenericValue))));
             data_.a.capacity = newCapacity;
@@ -1525,7 +1525,7 @@ public:
         \note Amortized constant time complexity.
     */
     GenericValue& PushBack(GenericValue& value, Allocator& allocator) {
-        RAPIDJSON_ASSERT(IsArray());
+        RAPIDJSON_TEST_TYPE(IsArray(), "Array", *this);
         if (data_.a.size >= data_.a.capacity)
             Reserve(data_.a.capacity == 0 ? kDefaultArrayCapacity : (data_.a.capacity + (data_.a.capacity + 1) / 2), allocator);
         GetElementsPointer()[data_.a.size++].RawAssign(value);
@@ -1580,7 +1580,7 @@ public:
         \note Constant time complexity.
     */
     GenericValue& PopBack() {
-        RAPIDJSON_ASSERT(IsArray());
+        RAPIDJSON_TEST_TYPE(IsArray(), "Array", *this);
         RAPIDJSON_ASSERT(!Empty());
         GetElementsPointer()[--data_.a.size].~GenericValue();
         return *this;
@@ -1606,7 +1606,7 @@ public:
         \note Linear time complexity.
     */
     ValueIterator Erase(ConstValueIterator first, ConstValueIterator last) {
-        RAPIDJSON_ASSERT(IsArray());
+        RAPIDJSON_TEST_TYPE(IsArray(), "Array", *this);
         RAPIDJSON_ASSERT(data_.a.size > 0);
         RAPIDJSON_ASSERT(GetElementsPointer() != 0);
         RAPIDJSON_ASSERT(first >= Begin());
@@ -1620,24 +1620,24 @@ public:
         return pos;
     }
 
-    Array GetArray() { RAPIDJSON_ASSERT(IsArray()); return Array(*this); }
-    ConstArray GetArray() const { RAPIDJSON_ASSERT(IsArray()); return ConstArray(*this); }
+    Array GetArray() { RAPIDJSON_TEST_TYPE(IsArray(), "Array", *this); return Array(*this); }
+    ConstArray GetArray() const { RAPIDJSON_TEST_TYPE(IsArray(), "Array", *this); return ConstArray(*this); }
 
     //@}
 
     //!@name Number
     //@{
 
-    int GetInt() const          { RAPIDJSON_ASSERT(data_.f.flags & kIntFlag);   return data_.n.i.i;   }
-    unsigned GetUint() const    { RAPIDJSON_ASSERT(data_.f.flags & kUintFlag);  return data_.n.u.u;   }
-    int64_t GetInt64() const    { RAPIDJSON_ASSERT(data_.f.flags & kInt64Flag); return data_.n.i64; }
-    uint64_t GetUint64() const  { RAPIDJSON_ASSERT(data_.f.flags & kUint64Flag); return data_.n.u64; }
+    int GetInt() const          { RAPIDJSON_TEST_TYPE(data_.f.flags & kIntFlag, "Int", *this);   return data_.n.i.i;   }
+    unsigned GetUint() const    { RAPIDJSON_TEST_TYPE(data_.f.flags & kUintFlag, "Uint", *this);  return data_.n.u.u;   }
+    int64_t GetInt64() const    { RAPIDJSON_TEST_TYPE(data_.f.flags & kInt64Flag, "Int64", *this); return data_.n.i64; }
+    uint64_t GetUint64() const  { RAPIDJSON_TEST_TYPE(data_.f.flags & kUint64Flag, "Uint64", *this); return data_.n.u64; }
 
     //! Get the value as double type.
     /*! \note If the value is 64-bit integer type, it may lose precision. Use \c IsLosslessDouble() to check whether the converison is lossless.
     */
     double GetDouble() const {
-        RAPIDJSON_ASSERT(IsNumber());
+        RAPIDJSON_TEST_TYPE(IsNumber(), "Double", *this);
         if ((data_.f.flags & kDoubleFlag) != 0)                return data_.n.d;   // exact type, no conversion.
         if ((data_.f.flags & kIntFlag) != 0)                   return data_.n.i.i; // int -> double
         if ((data_.f.flags & kUintFlag) != 0)                  return data_.n.u.u; // unsigned -> double
@@ -1649,7 +1649,7 @@ public:
     /*! \note If the value is 64-bit integer type, it may lose precision. Use \c IsLosslessFloat() to check whether the converison is lossless.
     */
     float GetFloat() const {
-        RAPIDJSON_ASSERT(IsFloat());
+        RAPIDJSON_TEST_TYPE(IsFloat(), "Float", *this);
         return static_cast<float>(GetDouble());
     }
 
@@ -1665,12 +1665,12 @@ public:
     //!@name String
     //@{
 
-    const Ch* GetString() const { RAPIDJSON_ASSERT(IsString()); return (data_.f.flags & kInlineStrFlag) ? data_.ss.str : GetStringPointer(); }
+    const Ch* GetString() const { RAPIDJSON_TEST_TYPE(IsString(), "String", *this); return (data_.f.flags & kInlineStrFlag) ? data_.ss.str : GetStringPointer(); }
 
     //! Get the length of string.
     /*! Since rapidjson permits "\\u0000" in the json string, strlen(v.GetString()) may not equal to v.GetStringLength().
     */
-    SizeType GetStringLength() const { RAPIDJSON_ASSERT(IsString()); return ((data_.f.flags & kInlineStrFlag) ? (data_.ss.GetLength()) : data_.s.length); }
+    SizeType GetStringLength() const { RAPIDJSON_TEST_TYPE(IsString(), "String", *this); return ((data_.f.flags & kInlineStrFlag) ? (data_.ss.GetLength()) : data_.s.length); }
 
     //! Set this value as a string without copying source string.
     /*! This version has better performance with supplied length, and also support string containing null character.
