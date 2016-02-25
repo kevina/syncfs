@@ -1,10 +1,12 @@
 # Introduction
 
-**SyncFS** is a Filesystem in Userspace (FUSE) that offers something
-between mounting a cloud storage system as a fuse filesystem while
-keeping all changes remotely and syncing a remote Clouse storage
-system and keeping the files locally.  It was original designed to
-provide a cloud storage backend to ZBackup.
+**SyncFS** is a [Filesystem in Userspace (FUSE)][FUSE] that offers
+something between mounting a cloud storage system using FUSE while
+keeping all changes remotely, and syncing a Cloud drive locally.  It
+was original designed to provide a cloud storage backend to [ZBackup].
+
+[FUSE]: https://github.com/libfuse/libfuse
+[ZBackup]: http://zbackup.org/
 
 It works by mirroring the files on the cloud (the remote) to the local
 filesystem, but only keeping the files local that are currently in
@@ -36,10 +38,13 @@ basis.
   * Verifies the integrity of all uploades and downloads using the the
     checksum provided by the remote.
 
-  * Supportes Google Drive as a remote.  Other remotes should be easy
+  * Supports [Google Drive] as a remote.  Other remotes should be easy
     to add.
 
-  * Uses an sqlite3 database with a simple schema for all state.
+  * Uses an [sqlite3] database with a simple schema for all state.
+
+[Google Drive]: https://www.google.com/drive/
+[sqlite3]: https://www.sqlite.org/
 
 # Major Limitations
 
@@ -66,9 +71,9 @@ SyncFS was devloped on UBuntu 12.04 and has the following dependencies:
   * Recent enough version of Gcc or Clang to support most of C++11.
     (Gcc 4.6.3 is known to work.)
   * Unix like operating system with FUSE support
-  * `sqlite3-dev`
-  * `libcurl4-dev-openssl` or `libcurl4-dev-gnutls`
-  * `libfuse-dev`
+  * `sqlite3-dev` (https://www.sqlite.org/)
+  * `libcurl4-dev-openssl` or `libcurl4-dev-gnutls` (https://curl.haxx.se/libcurl/)
+  * `libfuse-dev` (https://github.com/libfuse/libfuse)
 
 To build edit the `Makefile` for your system and then just:
 
@@ -78,15 +83,43 @@ make
 
 There is no install target.
 
+# Quick Start
+
+To test SyncFS using the sample config files do the following.  This
+will create the folder `syncfs-storage` in your Google Drive account.
+
+```bash
+mkdir data
+mkdir data/.etc
+cp doc/syncfs.conf data/.etc
+cp doc/drive.conf data/.etc
+mkdir mnt
+./syncfs data mnt
+```
+
+Then follow the instructions to give SyncFS authorization to your
+Google Drive account.  (It can be done on a headless server.)
+
+Any changes you make in mnt/ will then be uploaded to the
+`syncfs-storage` folder on Drive.  With the default config it will
+wait 30 seconds before uploading.  Then in the file is not used for 90
+seconds it will delete it locally and redownload it when required.
+
+To disconnect use:
+
+```base
+fusermount -u mnt
+```
+
 # Usage
 
 ## Startup
 
 To use create a directory `.etc/` inside the directory you want to
-sync with add create two configuration files ".etc/syncfs.conf" and
-".etc/drive.conf".  Sample configuration files can be found in the
-`doc/` directory.  The remote to use must be set in ".etc/syncfs.conf"
-and the REMOTEDIR to use must be set in ".etc/drive.conf", all other
+sync with add create two configuration files `.etc/syncfs.conf` and
+`.etc/drive.conf`.  Sample configuration files can be found in the
+`doc/` directory.  The remote to use must be set in `.etc/syncfs.con`
+and the REMOTEDIR to use must be set in `.etc/drive.conf`, all other
 settings are optional.
 
 Once this is done start syncfs using:
@@ -136,7 +169,7 @@ doing so they are any inconsistencies it will abort until they are
 fixed by using `--sync-to-local` or `sync-to-remote` or some other
 means.
 
-# Shutdown 
+## Shutdown 
 
 To shutdown SyncFS just unmount the filesystem using fusermount:
 
@@ -146,30 +179,18 @@ fusermount -u LOCALDIR
 
 Note, that SyncFS may shutdown even if there are remote operations in
 the queue.  To verify everything is in sync check that the virtual
-file ".proc/pending" has no content.  Like files in the /proc
+file `.proc/pending` has no content.  Like files in the /proc
 filesystem, the reported size is always zero; you need to open and
 read the verify there is no content.  The actual content of this file
 are not stable but will give you some idea of what operations are
 pending.  If SyncFS does not look like it is making any progress than
 there could be a problem connecting to the server, see the
-.etc/drive.log file to verify.
+`.etc/drive.log` file to verify.
 
-Note, that is SyncFS shuts down (or is killed) with pending operations
+Note, that if SyncFS shuts down (or is killed) with pending operations
 those operations will simply resume once SyncFS restarts.
 
-# State and log files
-
-SyncFS stores all its state in a sqlite3 database file named
-".var/fileinfo.db" under LOCALDIR that is also visable as a read-only
-file under the MOUNTPOINT.  You are free to query the database to
-learn about how SyncFS works or to get state information not easilly
-available otherwise but do not perform any modications or hold a lock
-on the database file for any length of time.
-
-SyncFS writes to two log files ".var/syncfs.log" and ".var/drive.log".
-These files can safely be truncated if they get too large.
-
-# Emptying the Trash
+## Emptying the Trash
 
 By default SyncFS will use the remote ability to move files to the
 trash instead of deleting them.  This can either be cleaned up
@@ -183,6 +204,31 @@ SyncFS will ask for confirmation before it proceeds and then
 permanently delete all trashed files in REMOTEDIR.  On some remotes
 that this can take awhile.
 
+# State and log files
 
+SyncFS stores all its state in a sqlite3 database file named
+`.var/fileinfo.db` under LOCALDIR that is also visable as a read-only
+file under the MOUNTPOINT.  You are free to query the database to
+learn about how SyncFS works or to get state information not easilly
+available otherwise but do not perform any modications or hold a lock
+on the database file for any length of time.
 
+SyncFS writes to two log files `.var/syncfs.log` and `.var/drive.log`.
+These files can safely be truncated if they get too large.
+
+# Status
+
+SyncFS is considered to be of Alpha qualify.  When used with zbackup I
+trust it enough to use it to backup my data on a VPS.  It us unlikely
+that it will destroy any of your data, but it might do odd things.
+
+# Adding Additional Remotes
+
+I will be happy to accept pull requests that add additional remotes
+(such as Amazon S3, or sftp).  I will likely reject the request,
+however, if it brings in any unneeded dependencies.
+
+# Feedback
+
+Please email me directly at k@kevina.org or use the GitHub issue tracker.
 
