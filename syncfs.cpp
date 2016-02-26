@@ -2102,7 +2102,7 @@ static void init_fuse_ops(fuse_operations & oper);
 
 void syncfs_usage()
 {
-  fprintf(stderr, "usage:  bbfs [FUSE and mount options] rootDir mountPoint remoutDir\n");
+  fprintf(stderr, "usage: syncfs [FUSE and mount options] rootDir mountPoint\n");
   abort();
 }
 
