@@ -1330,6 +1330,7 @@ void * uploader(void *) {
       uploader_localpart(more_to_do);
       //printf(">delete?> %lli\n", cid);
       DbMutex lock;
+      if (exiting) return NULL;
       auto res = sql_to_delete_check(cid);
       if (!res.step()) continue;
       string remote_id_path;
@@ -1346,6 +1347,7 @@ void * uploader(void *) {
       uploader_localpart(more_to_do);
       //printf(">rename?> %lli\n", cid);
       DbMutex lock;
+      if (exiting) return NULL;
       auto res = sql_to_upload_check(cid);
       if (!res.step()) continue;
       string remote_id,remote_path,path;
@@ -1366,6 +1368,7 @@ void * uploader(void *) {
       uploader_localpart(more_to_do);
       //printf(">upload?> %lli\n",  cid);
       DbMutex lock;
+      if (exiting) return NULL;
       auto res = sql_to_upload_check(cid);
       if (!res.step()) continue;
       string remote_id,remote_path,path;
@@ -1410,6 +1413,7 @@ void * uploader(void *) {
       more_to_do = std::min(more_to_do, REMOVE_WAIT);
     }
     lock.lock();
+    if (exiting) return NULL;
     uploader_waiting = true;
     error_backoff = MIN_BACKOFF_ERROR;
     if (global_more_to_do) {
