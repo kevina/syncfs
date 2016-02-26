@@ -1208,21 +1208,11 @@ SqlSelect sql_pending("select count(*), 'need cid' from need_cid union "
 		      "select count(*), 'need to be deleted' from to_delete union "
 		      "select count(*), 'need to be upload or renamed' from to_upload");
 
-void * uploader(void *) {
-  log_msg("*** starting uploader\n");
-  using std::vector;
-  using std::string;
-  int more_to_do = 0;
-  int error_backoff = MIN_BACKOFF_ERROR;
- loop: {
+void uploader_localpart(int & more_to_do) {
+  time_t now = time(NULL);
+  std::vector<ContentId> need_checksum;
+  {// Create any needed cid entries
     DbMutex lock;
-    if (exiting) return NULL;
-    global_more_to_do = false;
-    more_to_do = INT_MAX;
-    log_msg("*** starting uploader iteration\n");
-    time_t now = time(NULL);
-    vector<ContentId> need_checksum;
-    { // Create any needed cid entries
       SqlTrans trans;
       auto res = sql_need_cid();
       while (res.step()) {
@@ -1265,36 +1255,12 @@ void * uploader(void *) {
         unlink(fpath);
         sql_mark_removed.exec1(fid);
       }
-    }
-    // Gather work to be done, note: only upload one file at a time
-    vector<ContentId> to_delete;
-    vector<ContentId> to_rename;
-    vector<ContentId> to_upload; 
-    {
-      auto res = sql_to_delete();
-      while (res.step()) {
-        ContentId cid = 0;
-        res.get(cid);
-        to_delete.push_back(cid);
-      }
-      res = sql_to_upload();
-      while (res.step()) {
-        ContentId cid = 0;
-        bool do_rename = true;
-        res.get(cid, do_rename);
-        if (do_rename) {
-          to_rename.push_back(cid);
-        } else {
-          to_upload.push_back(cid);
-        }
-      }
-    }
-    lock.unlock();
+  }
     for (auto cid : need_checksum) {
       DbMutex lock;
       auto res = sql_checksum_check(cid);
       if (!res.step()) continue;
-      string path;
+      std::string path;
       res.get(path);
       res.reset();
       lock.unlock();
@@ -1318,7 +1284,50 @@ void * uploader(void *) {
       }
       sql_set_checksum.exec1(checksum.hex, cid);
     }
+}
+
+void * uploader(void *) {
+  log_msg("*** starting uploader\n");
+  using std::vector;
+  using std::string;
+  int more_to_do = 0;
+  int error_backoff = MIN_BACKOFF_ERROR;
+ loop: {
+    DbMutex lock;
+    if (exiting) return NULL;
+    global_more_to_do = false;
+    more_to_do = INT_MAX;
+    log_msg("*** starting uploader iteration\n");
+    lock.unlock();
+    uploader_localpart(more_to_do);
+    lock.lock();
+    // Gather work to be done, note: only upload one file at a time
+    time_t now = time(NULL);
+    vector<ContentId> to_delete;
+    vector<ContentId> to_rename;
+    vector<ContentId> to_upload; 
+    {
+      auto res = sql_to_delete();
+      while (res.step()) {
+        ContentId cid = 0;
+        res.get(cid);
+        to_delete.push_back(cid);
+      }
+      res = sql_to_upload();
+      while (res.step()) {
+        ContentId cid = 0;
+        bool do_rename = true;
+        res.get(cid, do_rename);
+        if (do_rename) {
+          to_rename.push_back(cid);
+        } else {
+          to_upload.push_back(cid);
+        }
+      }
+    }
+    lock.unlock();
     for (auto cid : to_delete) {
+      uploader_localpart(more_to_do);
       //printf(">delete?> %lli\n", cid);
       DbMutex lock;
       auto res = sql_to_delete_check(cid);
@@ -1334,6 +1343,7 @@ void * uploader(void *) {
       sql_mark_deleted.exec1(cid);
     }
     for (auto cid : to_rename) {
+      uploader_localpart(more_to_do);
       //printf(">rename?> %lli\n", cid);
       DbMutex lock;
       auto res = sql_to_upload_check(cid);
@@ -1353,6 +1363,7 @@ void * uploader(void *) {
       sql_mark_uploaded.exec1(path.c_str(), cid);
     }
     for (auto cid : to_upload) {
+      uploader_localpart(more_to_do);
       //printf(">upload?> %lli\n",  cid);
       DbMutex lock;
       auto res = sql_to_upload_check(cid);
