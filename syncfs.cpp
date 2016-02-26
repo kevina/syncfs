@@ -2135,11 +2135,20 @@ int main(int argc, char * *argv)
   // Pull the rootdir out of the argument list and save it in my
   // internal data
   rootdir = realpath(argv[argc-2], NULL);
+  if (rootdir == NULL) {
+    perror(rootdir);
+    exit(1);
+  }
   printf(">rootdir> %s\n", rootdir);
   argv[argc-2] = argv[argc-1];
   argv[argc-1] = NULL;
   argc--;
 
+  const char * mntdir = realpath(argv[argc-1], NULL);
+  if (mntdir == NULL) {
+    perror(mntdir);
+    exit(1);
+  }
   argv[argc-1] = realpath(argv[argc-1], NULL);
 
   int ret = chdir(rootdir);
