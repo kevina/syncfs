@@ -1759,7 +1759,7 @@ void sync_to_remote(bool noop, bool verbose) {
   }
 
   if (verbose) {
-    res = SqlSelect("select dir||name as path from fileinfo where fid not in (select fid from contentinfo)")();
+    res = SqlSelect("select dir||name as path from fileinfo where fid not in (select fid from contentinfo where fid is not null)")();
     while (res.step()) {
       const char * path;
       res.get(path);
@@ -1776,7 +1776,7 @@ void sync_to_remote(bool noop, bool verbose) {
 }
 
 const char * sql_remote_diff = 
-  "create temporary view remote_only as select * from remote where path not in (select remote_path from contentinfo); "
+  "create temporary view remote_only as select * from remote where path not in (select remote_path from contentinfo where remote_path is not null); "
   "create temporary view remote_diff as "
   "  select fid,cid, path, r.path is not null as in_remote, (r.size != f.size or r.checksum != f.checksum) as diff, r.mtime as r_mtime, f.mtime as f_mtime  "
   "  from (select fid,cid,remote_path as path, size, mtime, local, checksum from fileinfo join contentinfo using (fid,cid) where remote_path is not null) as f "
