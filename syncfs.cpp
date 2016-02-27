@@ -516,6 +516,7 @@ int syncfs_fsync(const char *, int datasync, struct fuse_file_info *fi)
 // Operations that involve the database
 //
 
+SqlSingle sql_get_fid("select fid from fileinfo where dir=? and name =?");
 SqlSingle sql_is_local("select local from fileinfo where dir=? and name=?");
 
 /** Remove a file */
@@ -561,9 +562,10 @@ int syncfs_unlink(const char *path)
   }
 }
 
-/** Rename a file */
 // both path and newpath are fs-relative
+SqlSelect sql_exists("select fid from fileinfo where dir=? and name=?");
 SqlStmt sql_rename("update fileinfo set dir=?, name=?, writable=? where dir=? and name=?");
+SqlSelect sql_getfiles("select fid,dir,name from fileinfo where dir is not null");
 //bool fdb_rename(const char *path, const char *newpath, DbMutex &);
 int syncfs_rename(const char *path, const char *newpath)
 {
@@ -591,17 +593,41 @@ int syncfs_rename(const char *path, const char *newpath)
   DbMutex lock;
 
   try {
-    sql_unlink.exec_nocheck(Path(newpath));
-
+    SqlTrans trans;
     bool local;
-    sql_is_local(Path(path)).get(local);
+    auto exists = sql_exists(Path(path));
+    if (exists.step()) {
+      sql_is_local(Path(path)).get(local);
+      sql_unlink.exec_nocheck(Path(newpath));
+      sql_rename.exec1(Path(newpath), path_writable(newpath), Path(path));
+    } else {
+      // we have a directory
+      // rename each path individually
+      auto res = sql_getfiles();
+      auto orig_len = strlen(path);
+      std::string newp;
+      while (res.step()) {
+	FileId fid;
+	const char * dir, *name;
+	res.get(fid,dir,name);
+	if (strncmp(dir, path, orig_len) != 0) continue;
+	newp = newpath;
+	newp += dir + orig_len;
+	newp += name;
+	//printf("=== %s%s => %s\n", dir,name, newp.c_str());
+	sql_unlink.exec_nocheck(Path(newp.c_str()));
+	sql_rename.exec1(Path(newp.c_str()), path_writable(newp.c_str()), dir, name);
+	local = true;
+      }
+    }
+
     if (local) {
       retstat = rename(fpath, fnewpath);
       if (retstat < 0)
         return syncfs_error("syncfs_rename rename");
     }
 
-    sql_rename.exec1(Path(newpath), path_writable(newpath), Path(path));
+    trans.commit();
     notify_uploader();
 
     return 0;
@@ -621,7 +647,6 @@ int syncfs_rename(const char *path, const char *newpath)
  * which will be passed to all file operations.
  *
  */
-SqlSingle sql_get_fid("select fid from fileinfo where dir=? and name =?");
 SqlStmt sql_open_file("update fileinfo set opened=max(?1,opened),open_count=open_count + 1 where fid=?2");
 SqlStmt sql_create("insert into fileinfo (dir, name, local, mtime, atime, opened, open_count, writable) values (?1,?2,1,?3,?3,2,1,?4)");
 SqlStmt sql_mark_dirty("update fileinfo set cid=NULL where fid=?"); 
