@@ -222,6 +222,17 @@ SyncFS is considered to be of Alpha qualify.  When used with zbackup I
 trust it enough to use it to backup my data on a VPS.  It us unlikely
 that it will destroy any of your data, but it might do odd things.
 
+# Upgrading
+
+As SyncFS is Alpha software the database schema may change at any
+time.  As the database serves as a cache the cleanest way to upgrade
+is to use the old version to make sure there are no pending
+operations (`.proc/pending` is empty) and then (after unmounting the
+filesystem) use the `--reset-db` option with the new version.  If this
+is done before all pending operations are clear than SyncFS might
+report discrepancies that need to be manually fixed before it will
+start.
+
 # Adding Additional Remotes
 
 I will be happy to accept pull requests that add additional remotes

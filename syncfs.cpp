@@ -56,6 +56,8 @@
 // Global state
 //
 
+#define SCHEMA_VERSION "1"
+
 static const char * rootdir = NULL;
 FILE * logfile = NULL;
 RemoteState remote_state;
@@ -106,6 +108,43 @@ static void notify_uploader() {
 
 void log_msg(const char *format, ...)
   __attribute__ ((format (printf, 1, 2)));
+
+static void check_schema(bool reset_db) {
+  FILE * f = NULL;
+  f = fopen(".var/schema_version", "r");
+  if (reset_db) goto create;
+  if (!f && errno == ENOENT) goto create;
+  if (!f) goto error;
+  {
+    char * str;
+    size_t sz = 0;
+    auto len = getline(&str, &sz, f);
+    if (len == -1 && ferror(f)) goto error;
+    if (len == 0 || len == -1) goto create;
+    if (str[len-1] == '\n') str[len-1] = '\0';
+    if (strcmp(str, SCHEMA_VERSION) != 0) {
+      fprintf(stderr, "Schema version mismatch (existing: %s, need: %s) please reset the database.\n", str, SCHEMA_VERSION);
+      exit (-1);
+    }
+  }
+  /* all good */
+  fclose(f);
+  return;
+ create: {
+    if (f) fclose(f);
+    FILE * f = fopen(".var/schema_version", "w");
+    if (!f) goto error;
+    int res = fprintf(f, "%s\n", SCHEMA_VERSION);
+    if (res < 0) goto error;
+    fclose(f);
+    return;
+  }
+ error: {
+    if (f) fclose(f);
+    fprintf(stderr, "Problem when reading or writing file: .var/schema_version\n");
+    exit (-1);
+  }
+}
 
 
 //////////////////////////////////////////////////////////////////////////////
@@ -2081,6 +2120,7 @@ void sql_trace(void*, const char* str) {
 
 void init_db(const char * dir, bool reset_db) {
   int ret = 0;
+  check_schema(reset_db);
   try {
     const char * dbhome = ".var";
     mkdir(dbhome,0777);
