@@ -524,9 +524,11 @@ ApiResp DriveApi::perform_noretry(bool reauthorize) const {
 
   // Parse output if required
   if (parse_output && strspn(resp.str.c_str(), " \n\r") < resp.str.size()) {
-    json::Document root;
-    root.Parse(resp.str.c_str());
-    resp.data = std::move(root);
+    try {
+      json::Document root;
+      root.Parse(resp.str.c_str());
+      resp.data = std::move(root);
+    } catch (JsonException &) {}
   }
 
   return resp;
