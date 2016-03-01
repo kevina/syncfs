@@ -1,15 +1,15 @@
 #!/bin/sh
 
 #
-# This is the script I used to test SyncFS with zbackup.
+# This is the script I use internally test SyncFS with zbackup.
 #
 
 set -e
 set -x
 
-fusermount -uz ./backup
+fusermount -uz ./backup || true
 sleep 1
-./zbfs data backup 
+./syncfs data backup
 
 rm -f backup/info
 rm -rf backup/bundles
@@ -50,7 +50,45 @@ fusermount -u ./backup
 sleep 1
 rm -r data/*
 
-./zbfs data backup
+./syncfs data backup
 
 ../zbackup --non-encrypted restore backup/backups/backup-3 > backup-3-res
 cmp to-backup-3 backup-3-res
+
+while pending=`cat /aux/backup/k/backup/.proc/pending`
+      test -n "$pending"
+do echo "SyncFS Still Busy..."
+   sleep 5
+done
+
+fusermount -u ./backup
+rm -r data/*
+
+rm data/.var/fileinfo.db
+./syncfs data backup
+
+../zbackup --non-encrypted restore backup/backups/backup-3 > backup-3-res
+cmp to-backup-3 backup-3-res
+
+sleep 7
+
+if [ -n "`find data/bundles -type f`" ]
+then
+  echo "ERROR: data/bundles not removed locally when it should be"
+  fusermount -u ./backup
+  exit 1
+fi
+
+# 90 seconds is the default delete time unless otherwise specified
+sleep 100
+
+if [ ! \( -e data/info -o -e data/backups/backup-3 \) ]
+then
+  echo "ERROR: data/info or other file removed locally when it should be kept"
+  fusermount -u ./backup
+  exit 1
+fi
+
+fusermount -u ./backup
+
+echo "ALL TEST PASS"

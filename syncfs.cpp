@@ -238,9 +238,9 @@ struct ShouldUpload {
     auto i = data.begin();
     Val val = {-1, -1, -1};
     while (auto v = data.match(path, i)) {
-      if (v->min_wait != -1) val.min_wait = v->min_wait;        
-      if (v->max_wait != -1) val.max_wait = v->max_wait;        
-      if (v->keep_size != -1) val.keep_size = v->keep_size;
+      if (val.min_wait == -1 && v->min_wait != -1) val.min_wait = v->min_wait;
+      if (val.max_wait == -1 && v->max_wait != -1) val.max_wait = v->max_wait;
+      if (val.keep_size == -1 && v->keep_size != -1) val.keep_size = v->keep_size;
     }
     if (val.keep_size != 0) {
       if (now - mtime >= val.max_wait) return 0;
@@ -269,7 +269,7 @@ struct MayRemove {
     auto i = data.begin();
     Val val = {-1};
     while (auto v = data.match(path, i)) {
-      if (v->wait != -1) val.wait = v->wait;    
+      if (val.wait == -1 && v->wait != -1) val.wait = v->wait;
     }
     if (val.wait == FOREVER) return -1;
     if (now - atime < val.wait) return val.wait;
@@ -2048,6 +2048,9 @@ static void read_config() {
     }
     may_remove.data.prioritize();
     may_remove.data.push_back({"/", {REMOVE_WAIT}});
+    //for (auto & v : may_remove.data) {
+    //  printf(">may remove>%s %d\n", v.first.path.c_str(), v.second.wait);
+    //}
 
   } catch (JsonException & err) {
     fprintf(stderr, "ERROR: %s: ", fn);
