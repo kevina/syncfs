@@ -29,6 +29,7 @@ struct SqlError {
   }
   SqlError(const char * msg) : retcode(), code(), msg(msg) {}
   SqlError(std::string && msg) : retcode(), code(), msg(std::move(msg)) {}
+  SqlError & w_query(std::string && q) {msg = '"' + q + "\": " + msg; return *this;}
 };
 
 class SqlStmtBase {
@@ -46,7 +47,7 @@ public:
     assert(db_locked);
     if (stmt == NULL) {
       int res = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
-      if (res != 0) throw SqlError(res, db);
+      if (res != 0) throw SqlError(res, db).w_query(sql);
     }
   }
   const char * const sql;
@@ -105,10 +106,12 @@ public:
 
 class SqlResult {
 public:
+  SqlResult() : db(), stmt() {}
   SqlResult(sqlite3 * db, sqlite3_stmt * stmt) : db(db), stmt(stmt) {}
   SqlResult(SqlResult && other) 
     : db(other.db), stmt(other.stmt) {other.stmt = NULL;}
   SqlResult & operator=(SqlResult && other) {
+    reset();
     db = other.db;
     stmt = other.stmt;
     other.stmt = NULL;
@@ -188,7 +191,7 @@ public:
 void sql_exec(const char * sql) {
   assert(db_locked);
   auto ret = sqlite3_exec(db, sql, NULL, NULL, NULL);
-  if (ret != 0) throw SqlError(ret, db);
+  if (ret != 0) throw SqlError(ret, db).w_query(sql);
 }
 
 class SqlTrans {
