@@ -39,6 +39,9 @@
 #include <utility>
 #include <limits>
 
+using std::string;
+using std::vector;
+
 #ifdef NDEBUG
 // CMake can enable NDEBUG, something that is rarely done in the Unix
 // world.  I am not alone in considering -DNDEBUG to be EBW =
@@ -88,7 +91,9 @@ struct ScopedMutex {
   pthread_mutex_t * mutex;
   bool locked;
   ScopedMutex(pthread_mutex_t * m) : mutex(m), locked(false) {lock();}
-  ~ScopedMutex() {unlock();}
+  ScopedMutex(ScopedMutex && other) : mutex(other.mutex), locked(other.locked) {other.mutex = NULL;}
+  ScopedMutex & operator=(ScopedMutex & other) = delete;
+  ~ScopedMutex() {if (mutex) unlock();}
   void unlock() {if (locked && mutex == &db_mutex) db_locked = false; if (locked) pthread_mutex_unlock(mutex); locked = false; }
   void lock() {if (!locked) pthread_mutex_lock(mutex); locked = true; if (mutex == &db_mutex) db_locked = true; }
 };
@@ -1236,11 +1241,18 @@ int fetch_path(const char * fpath, FileId fid, DbMutex & lock) {
 // Background uploader
 //
 
+// Action twiplet
+//   delete cid remote_path
+//   rename cid remote_path new_path
+//   upload cid remote_path
+
+//   existing_cid,path,rename_to,upload_cid
+
 const char * uploader_views =
-  "drop view if exists may_remove;"
-  "create view may_remove as "
-  "  select fid,dir||name as path,atime,mtime,size from fileinfo join contentinfo using (cid) "
-  "  where cid = remote_cid and local and opened=0 and not keep_local; "
+  "drop view if exists want_to_remove;"
+  "create view want_to_remove as "
+  "  select fid,dir||name as path,atime,mtime,size,coalesce(cid = remote_cid,0) as may_remove from fileinfo join contentinfo using (cid) "
+  "  where local and opened=0 and not keep_local; "
   "drop view if exists pending;"
   "create view pending as"
   "  select fid, "
@@ -1260,7 +1272,7 @@ static inline bool same_content(FileId fid, ContentId cid) {
 SqlSelect sql_need_checksum("select fid from fileinfo join contentinfo using (cid) where checksum is null");
 SqlSelect sql_checksum_check("select cid,dir||name as path from fileinfo join contentinfo using (cid) where fid = ? and checksum is null");
 SqlStmt sql_set_checksum("update contentinfo set checksum=? where cid = ?");
-SqlSelect sql_may_remove("select * from may_remove");
+SqlSelect sql_want_to_remove("select * from want_to_remove order by round(size/1024/1024) desc, mtime");
 SqlStmt sql_mark_removed("update fileinfo set local=0 where fid=?");
 SqlStmt sql_mark_never_remove("update fileinfo set keep_local=1 where fid=?");
 
@@ -1280,7 +1292,7 @@ SqlStmt sql_mark_bad_upload("update fileinfo set remote_cid = NULL, remote_path 
 
 SqlSelect sql_file_exists("select 1 from fileinfo where dir=? and name=?");
 
-void uploader_localpart(int & more_to_do) {
+void uploader_localpart(int & more_to_do, std::vector<FileId> & want_to_remove) {
   time_t now = time(NULL);
   std::vector<FileId> need_checksum;
   {
@@ -1293,25 +1305,30 @@ void uploader_localpart(int & more_to_do) {
         need_checksum.push_back(fid);
       }
       // Delete any local files that are already upload and can be removed
-      res = sql_may_remove();
+      res = sql_want_to_remove();
       while (res.step()) {
         FileId fid;
         const char * path;
         int atime,mtime,size;
-        res.get(fid, path, atime, mtime, size);
-        int status = may_remove(fid, path, atime, mtime, size, now);
+	bool may_remove;
+        res.get(fid, path, atime, mtime, size, may_remove);
+        int status = ::may_remove(fid, path, atime, mtime, size, now);
         if (status > 0) {
           more_to_do = std::min(more_to_do, status);
           continue;
         } else if (status < 0) {
           sql_mark_never_remove.exec1(fid);
           continue;
-        }
-        char fpath[PATH_MAX];
-        syncfs_fullpath(fpath, path);
-        log_msg("*** removing local copy of %s\n", path);
-        unlink(fpath);
-        sql_mark_removed.exec1(fid);
+        } else if (may_remove) {
+	  char fpath[PATH_MAX];
+	  syncfs_fullpath(fpath, path);
+	  log_msg("*** removing local copy of %s\n", path);
+	  unlink(fpath);
+	  sql_mark_removed.exec1(fid);
+	} else {
+	  log_msg("--- want to remove but can't %s\n", path);
+	  want_to_remove.push_back(fid);
+	}
       }
   }
     for (auto fid : need_checksum) {
@@ -1340,6 +1357,16 @@ void uploader_localpart(int & more_to_do) {
       sql_set_checksum.exec1(checksum.hex, cid);
     }
 }
+void uploader_localpart(int & more_to_do) {
+  std::vector<FileId> want_to_remove;
+  uploader_localpart(more_to_do, want_to_remove);
+}
+
+struct Fail {};
+
+bool do_delete(FileId fid, int & more_to_do, time_t now, DbMutex lock);
+bool do_rename(FileId fid, int & more_to_do, time_t now, DbMutex lock);
+bool do_upload(FileId fid, int & more_to_do, time_t now, DbMutex lock);
 
 void * uploader(void *) {
   log_msg("*** starting uploader\n");
@@ -1347,16 +1374,17 @@ void * uploader(void *) {
   using std::string;
   int more_to_do = 0;
   int error_backoff = MIN_BACKOFF_ERROR;
- loop: {
+  //int remote_space_to_recover = 0;
+  for (;;) {
     DbMutex lock;
     if (exiting) return NULL;
     global_more_to_do = false;
     more_to_do = INT_MAX;
     log_msg("*** starting uploader iteration\n");
     lock.unlock();
-    uploader_localpart(more_to_do);
+    vector<FileId> want_to_remove;
+    uploader_localpart(more_to_do, want_to_remove);
     lock.lock();
-    // Gather work to be done, note: only upload one file at a time
     time_t now = time(NULL);
     vector<FileId> to_delete;
     vector<FileId> to_upload; 
@@ -1377,114 +1405,46 @@ void * uploader(void *) {
       }
     }
     lock.unlock();
-    for (auto fid : to_delete) {
-      uploader_localpart(more_to_do);
-      //printf(">delete?> %lli\n", fid);
-      DbMutex lock;
-      if (exiting) return NULL;
-      auto res = sql_to_delete_check(fid);
-      if (!res.step()) continue;
-      string remote_id_path;
-      res.get(remote_id_path);
-      lock.unlock();
-      log_msg("*** deleting %s\n", remote_id_path.c_str());
-      int ret = remote.del(&remote_state, remote_id_path.c_str());
-      lock.lock();
-      if (ret != 0) {sql_mark_failure.exec1(fid); goto fail;}
-      error_backoff = MIN_BACKOFF_ERROR;
-      sql_mark_deleted.exec1(fid);
-    }
-    for (auto fid : to_rename) {
-      uploader_localpart(more_to_do);
-      //printf(">rename?> %lli\n", cid);
-      DbMutex lock;
-      if (exiting) return NULL;
-      auto res = sql_to_rename_check(fid);
-      if (!res.step()) continue;
-      string remote_id,remote_path,path;
-      time_t mtime;
-      res.get(remote_id,remote_path,path,mtime);
-      if (remote_path.empty()) continue;
-      if (remote_id.empty()) 
-        remote_id = remote_path;
-      lock.unlock();
-      log_msg("*** renaming %s -> %s\n", remote_path.c_str(), path.c_str());
-      int ret = remote.rename(&remote_state, remote_id.c_str(), path.c_str(), mtime);
-      lock.lock();
-      if (ret != 0) {sql_mark_failure.exec1(fid); goto fail;}
-      error_backoff = MIN_BACKOFF_ERROR;
-      sql_mark_renamed.exec1(path.c_str(), fid);
-    }
-    for (auto fid : to_upload) {
-      uploader_localpart(more_to_do);
-      //printf(">upload?> %lli\n",  cid);
-      DbMutex lock;
-      if (exiting) return NULL;
-      auto res = sql_to_upload_check(fid);
-      if (!res.step()) continue;
-      ContentId cid0;
-      string remote_id,remote_path,path;
-      time_t atime,mtime;
-      int size;
-      const char * checksum_str;
-      res.get(cid0,remote_id,remote_path,path,mtime,atime,size,checksum_str);
-      CheckSum local_checksum = checksum_str;
-      int status = should_upload(0,path.c_str(),atime,mtime,size,now);
-      if (status > 0) {
-        more_to_do = std::min(more_to_do, status);
-        continue;
-      } else if (status < 0) {
-        continue;
+    try {
+      for (auto fid : to_delete) {
+	uploader_localpart(more_to_do);
+	DbMutex lock;
+	if (exiting) return NULL;
+	bool did_something = do_delete(fid, more_to_do, now, std::move(lock));
+	if (did_something) error_backoff = MIN_BACKOFF_ERROR;
       }
-      lock.unlock();
-      log_msg("*** uploading %s\n", path.c_str());
-      int ret;
-      char id[256] = "";
-      CheckSum checksum;
-      char fpath[PATH_MAX];
-      syncfs_fullpath(fpath, path.c_str());
-      if (remote_id.empty()) {
-        ret = remote.upload_new(&remote_state, fpath, path.c_str(), id, 256, &checksum);
+      for (auto fid : to_rename) {
+	uploader_localpart(more_to_do);
+	DbMutex lock;
+	if (exiting) return NULL;
+	bool did_something = do_rename(fid, more_to_do, now, std::move(lock));
+	if (did_something) error_backoff = MIN_BACKOFF_ERROR;
+      }
+      for (auto fid : to_upload) {
+	uploader_localpart(more_to_do);
+	DbMutex lock;
+	if (exiting) return NULL;
+	bool did_something = do_upload(fid, more_to_do, now, std::move(lock));
+	if (did_something) error_backoff = MIN_BACKOFF_ERROR;
+      }
+      lock.lock();
+      if (exiting) return NULL;
+      uploader_waiting = true;
+      error_backoff = MIN_BACKOFF_ERROR;
+      if (global_more_to_do) {
+	log_msg("*** still more to do ...\n");
+	/* don't wait */
+      } else if (more_to_do < INT_MAX) {
+	log_msg("*** more to do, waiting %d seconds\n", more_to_do);
+	struct timespec wait_until;
+	clock_gettime(CLOCK_REALTIME, &wait_until);
+	wait_until.tv_sec += more_to_do;
+	pthread_cond_timedwait(&uploader_cond, &db_mutex, &wait_until);
       } else {
-        ret = remote.replace(&remote_state, fpath, remote_id.c_str(), &checksum);
+	log_msg("*** all done, waiting for something to do\n");
+	pthread_cond_wait(&uploader_cond, &db_mutex);
       }
-      lock.lock();
-      if (ret != 0) {sql_mark_failure.exec1(fid); goto fail;}
-      if (id[0] != '\0')
-        sql_assign_remote_id.exec1(id, fid);
-      if (!same_content(fid,cid0)) {
-        log_msg("*** file changed from under us, marking upload as bad %s\n", path.c_str());
-	sql_mark_bad_upload.exec1(path.c_str(), fid); continue;
-      }
-      if (checksum != local_checksum) {
-        log_msg("*** checksum mismatch after upload on path %s\n", path.c_str());
-        sql_mark_bad_upload.exec1(path.c_str(), fid); continue;
-      } else {
-        log_msg("*** checksum ok after upload: %s\n", path.c_str());
-      }
-      error_backoff = MIN_BACKOFF_ERROR;
-      sql_mark_uploaded.exec1(cid0, path.c_str(), fid);
-      more_to_do = std::min(more_to_do, REMOVE_WAIT);
-    }
-    lock.lock();
-    if (exiting) return NULL;
-    uploader_waiting = true;
-    error_backoff = MIN_BACKOFF_ERROR;
-    if (global_more_to_do) {
-      log_msg("*** still more to do ...\n");
-      /* don't wait */
-    } else if (more_to_do < INT_MAX) {
-      log_msg("*** more to do, waiting %d seconds\n", more_to_do);
-      struct timespec wait_until;
-      clock_gettime(CLOCK_REALTIME, &wait_until);
-      wait_until.tv_sec += more_to_do;
-      pthread_cond_timedwait(&uploader_cond, &db_mutex, &wait_until);
-    } else {
-      log_msg("*** all done, waiting for something to do\n");
-      pthread_cond_wait(&uploader_cond, &db_mutex);
-    }
-    goto loop;
-  fail: {
+    } catch (Fail) {
       lock.lock();
       log_msg("*** error, waiting %d seconds and trying again\n", error_backoff);
       struct timespec wait_until, now;
@@ -1498,10 +1458,94 @@ void * uploader(void *) {
       } while (now.tv_sec <wait_until.tv_sec);
       error_backoff = std::min(error_backoff * 2, MAX_BACKOFF_ERROR);
     }
-    goto loop;
   }
 }
 
+bool do_delete(FileId fid, int & more_to_do, time_t now, DbMutex lock) {
+  //printf(">delete?> %lli\n", fid);
+  assert(lock.locked);
+  auto res = sql_to_delete_check(fid);
+  if (!res.step()) return false;
+  string remote_id_path;
+  res.get(remote_id_path);
+  lock.unlock();
+  log_msg("*** deleting %s\n", remote_id_path.c_str());
+  int ret = remote.del(&remote_state, remote_id_path.c_str());
+  lock.lock();
+  if (ret != 0) {sql_mark_failure.exec1(fid); throw Fail();}
+  sql_mark_deleted.exec1(fid);
+  return true;
+}
+
+bool do_rename(FileId fid, int & more_to_do, time_t now, DbMutex lock) { 
+  //printf(">rename?> %lli\n", cid);
+  assert(lock.locked);
+  auto res = sql_to_rename_check(fid);
+  if (!res.step()) return false;
+  string remote_id,remote_path,path;
+  time_t mtime;
+  res.get(remote_id,remote_path,path,mtime);
+  if (remote_path.empty()) return false;
+  if (remote_id.empty()) 
+    remote_id = remote_path;
+  lock.unlock();
+  log_msg("*** renaming %s -> %s\n", remote_path.c_str(), path.c_str());
+  int ret = remote.rename(&remote_state, remote_id.c_str(), path.c_str(), mtime);
+  lock.lock();
+  if (ret != 0) {sql_mark_failure.exec1(fid); throw Fail();}
+  sql_mark_renamed.exec1(path.c_str(), fid);
+  return true;
+}
+
+bool do_upload(FileId fid, int & more_to_do, time_t now, DbMutex lock) {
+  //printf(">upload?> %lli\n",  cid);
+  assert(lock.locked);
+  auto res = sql_to_upload_check(fid);
+  if (!res.step()) return false;
+  ContentId cid0;
+  string remote_id,remote_path,path;
+  time_t atime,mtime;
+  int size;
+  const char * checksum_str;
+  res.get(cid0,remote_id,remote_path,path,mtime,atime,size,checksum_str);
+  CheckSum local_checksum = checksum_str;
+  int status = should_upload(0,path.c_str(),atime,mtime,size,now);
+  if (status > 0) {
+    more_to_do = std::min(more_to_do, status);
+    return false;
+  } else if (status < 0) {
+    return false;
+  }
+  lock.unlock();
+  log_msg("*** uploading %s\n", path.c_str());
+  int ret;
+  char id[256] = "";
+  CheckSum checksum;
+  char fpath[PATH_MAX];
+  syncfs_fullpath(fpath, path.c_str());
+  if (remote_id.empty()) {
+    ret = remote.upload_new(&remote_state, fpath, path.c_str(), id, 256, &checksum);
+  } else {
+    ret = remote.replace(&remote_state, fpath, remote_id.c_str(), &checksum);
+  }
+  lock.lock();
+  if (ret != 0) {sql_mark_failure.exec1(fid); throw Fail();}
+  if (id[0] != '\0')
+    sql_assign_remote_id.exec1(id, fid);
+  if (!same_content(fid,cid0)) {
+    log_msg("*** file changed from under us, marking upload as bad %s\n", path.c_str());
+    sql_mark_bad_upload.exec1(path.c_str(), fid); return false;
+  }
+  if (checksum != local_checksum) {
+    log_msg("*** checksum mismatch after upload on path %s\n", path.c_str());
+    sql_mark_bad_upload.exec1(path.c_str(), fid); return false;
+  } else {
+    log_msg("*** checksum ok after upload: %s\n", path.c_str());
+  }
+  sql_mark_uploaded.exec1(cid0, path.c_str(), fid);
+  more_to_do = std::min(more_to_do, REMOVE_WAIT);
+  return true;
+}
 
 //////////////////////////////////////////////////////////////////////////////
 //
