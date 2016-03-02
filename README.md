@@ -52,7 +52,7 @@ basis.
     everything in a single folder and the directory will become part
     of the filename.
 
-  * There is no support for symbolic or hard links and only basis file
+  * There is no support for symbolic or hard links and only basic file
     system operations are supported for now.
 
   * To keep the remote from doing anything fancy with the file all
@@ -237,7 +237,12 @@ start.
 
 I will be happy to accept pull requests that add additional remotes
 (such as Amazon S3, or sftp).  I will likely reject the request,
-however, if it brings in any unneeded dependencies.
+however, if it brings in any unneeded dependencies.  For example, if
+XML parsing is required by the REST API then it is okay to bring in a
+lightweight (and efficient) XML parser such as RapidXML or pugixml;
+however, I will likely reject a pull request that brings in a full SDK
+as oen of the ideas behind a REST API is that it should be possible to
+use one with normal HTTP requests.
 
 # Feedback
 
