@@ -1260,8 +1260,9 @@ const char * uploader_views =
   "    dir is null and remote_path is not null as to_delete, "
   "    dir is not null and checksum is not null and (remote_cid is null or cid != remote_cid) as to_upload, "
   "    coalesce(dir||name != remote_path,0) as to_rename, "
-  "    (select fid from fileinfo where fid != f.fid and f.dir||f.name = remote_path) as blocked_by "
-  "  from fileinfo f left join contentinfo using (cid);"
+  "    (select fid from fileinfo where fid != f.fid and f.dir||f.name = remote_path) as blocked_by, "
+  "    case when dir is null then 0 else size end - case when remote_path is null then 0 else r_size end as size_delta "
+  "  from fileinfo f left join contentinfo using (cid) left join (select cid as remote_cid, size as r_size from contentinfo) using (remote_cid);"
   ;
 
 SqlSelect sql_same_content("select 1 from fileinfo where fid = ? and cid = ?");
@@ -1280,9 +1281,9 @@ SqlStmt sql_mark_never_remove("update fileinfo set keep_local=1 where fid=?");
 
 SqlSelect sql_pending("select * from pending where to_delete or to_rename or to_upload");
 
-SqlSelect sql_to_delete_check("select coalesce(remote_id,remote_path) from pending join fileinfo using (fid) where to_delete and fid = ?");
+SqlSelect sql_to_delete_check("select coalesce(remote_id,remote_path),size_delta from pending join fileinfo using (fid) where to_delete and fid = ?");
 SqlSelect sql_to_rename_check("select remote_id,remote_path, dir||name as path,mtime,blocked_by from pending join fileinfo using (fid) where to_rename and fid = ?");
-SqlSelect sql_to_upload_check("select cid,remote_id,remote_path,dir||name as path,mtime,atime,size,checksum,blocked_by from pending join fileinfo using (fid) join contentinfo using (cid) where to_upload and fid = ?");
+SqlSelect sql_to_upload_check("select cid,remote_id,remote_path,dir||name as path,mtime,atime,size,checksum,blocked_by,size_delta from pending join fileinfo using (fid) join contentinfo using (cid) where to_upload and fid = ?");
 
 SqlStmt sql_mark_deleted("update fileinfo set remote_id = null, remote_path = null, remote_failures = 0 where fid = ?");
 SqlStmt sql_mark_renamed("update fileinfo set remote_path = ? where fid = ?");
@@ -1361,9 +1362,14 @@ void uploader_localpart(int & more_to_do, DbMutex & lock, std::vector<FileId> * 
 struct Fail {};
 struct Exit {};
 
-bool do_delete(FileId fid, int & more_to_do, time_t now, DbMutex & lock);
+struct OpRes {
+  bool did_something;
+  ssize_t remote_space_change;
+};
+
+OpRes do_delete(FileId fid, int & more_to_do, time_t now, DbMutex & lock);
 bool do_rename(FileId fid, int & more_to_do, time_t now, DbMutex & lock);
-bool do_upload(FileId fid, int & more_to_do, time_t now, DbMutex & lock);
+OpRes do_upload(FileId fid, int & more_to_do, time_t now, DbMutex & lock);
 
 void * uploader(void *) {
   log_msg("*** starting uploader\n");
@@ -1387,8 +1393,8 @@ void * uploader(void *) {
       if (exiting) throw Exit();
       time_t now = time(NULL);
       for (auto fid : want_to_remove) {
-	bool did_something = do_upload(fid, more_to_do, now, lock);
-	if (did_something) {
+	auto res = do_upload(fid, more_to_do, now, lock);
+	if (res.did_something) {
 	  error_backoff = MIN_BACKOFF_ERROR;
 	  goto again;
 	}
@@ -1417,8 +1423,8 @@ void * uploader(void *) {
     lock.unlock();
     for (auto fid : to_delete) {
       handle_local_part();
-      bool did_something = do_delete(fid, more_to_do, now, lock);
-      if (did_something) error_backoff = MIN_BACKOFF_ERROR;
+      auto res = do_delete(fid, more_to_do, now, lock);
+      if (res.did_something) error_backoff = MIN_BACKOFF_ERROR;
     }
     for (auto fid : to_rename) {
       handle_local_part();
@@ -1427,8 +1433,8 @@ void * uploader(void *) {
     }
     for (auto fid : to_upload) {
       handle_local_part();
-      bool did_something = do_upload(fid, more_to_do, now, lock);
-      if (did_something) error_backoff = MIN_BACKOFF_ERROR;
+      auto res = do_upload(fid, more_to_do, now, lock);
+      if (res.did_something) error_backoff = MIN_BACKOFF_ERROR;
     }
     lock.lock();
     if (exiting) return NULL;
@@ -1467,13 +1473,14 @@ void * uploader(void *) {
   goto loop;
 }
 
-bool do_delete(FileId fid, int & more_to_do, time_t now, DbMutex & lock) {
+OpRes do_delete(FileId fid, int & more_to_do, time_t now, DbMutex & lock) {
   //printf(">delete?> %lli\n", fid);
   lock.lock();
   auto res = sql_to_delete_check(fid);
-  if (!res.step()) return false;
+  if (!res.step()) return {false,0};
   string remote_id_path;
-  res.get(remote_id_path);
+  int size_delta;
+  res.get(remote_id_path,size_delta);
   res.reset();
   lock.unlock();
   log_msg("*** deleting %s\n", remote_id_path.c_str());
@@ -1481,7 +1488,7 @@ bool do_delete(FileId fid, int & more_to_do, time_t now, DbMutex & lock) {
   lock.lock();
   if (ret != 0) {sql_mark_failure.exec1(fid); throw Fail();}
   sql_mark_deleted.exec1(fid);
-  return true;
+  return {true, size_delta};
 }
 
 bool do_rename(FileId fid, int & more_to_do, time_t now, DbMutex & lock) { 
@@ -1510,29 +1517,30 @@ bool do_rename(FileId fid, int & more_to_do, time_t now, DbMutex & lock) {
   return true;
 }
 
-bool do_upload(FileId fid, int & more_to_do, time_t now, DbMutex & lock) {
+OpRes do_upload(FileId fid, int & more_to_do, time_t now, DbMutex & lock) {
   //printf(">upload?> %lli\n",  cid);
   lock.lock();
   auto res = sql_to_upload_check(fid);
-  if (!res.step()) return false;
+  if (!res.step()) return {false, 0};
   ContentId cid0;
   string remote_id,remote_path,path;
   time_t atime,mtime;
   int size;
   const char * checksum_str;
   FileId blocked_by;
-  res.get(cid0,remote_id,remote_path,path,mtime,atime,size,checksum_str,blocked_by);
+  int size_delta;
+  res.get(cid0,remote_id,remote_path,path,mtime,atime,size,checksum_str,blocked_by,size_delta);
   if (blocked_by != 0) {
     more_to_do = std::min(more_to_do, 1);
-    return false;
+    return {false, 0};
   }
   CheckSum local_checksum = checksum_str;
   int status = should_upload(0,path.c_str(),atime,mtime,size,now);
   if (status > 0) {
     more_to_do = std::min(more_to_do, status);
-    return false;
+    return {false, 0};
   } else if (status < 0) {
-    return false;
+    return {false, 0};
   }
   res.reset();
   lock.unlock();
@@ -1565,7 +1573,7 @@ bool do_upload(FileId fid, int & more_to_do, time_t now, DbMutex & lock) {
   }
   sql_mark_uploaded.exec1(cid0, path.c_str(), fid);
   more_to_do = std::min(more_to_do, REMOVE_WAIT);
-  return true;
+  return {true, size_delta};
 }
 
 //////////////////////////////////////////////////////////////////////////////
