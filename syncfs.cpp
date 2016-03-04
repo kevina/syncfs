@@ -59,7 +59,7 @@ using std::vector;
 // Global state
 //
 
-#define SCHEMA_VERSION "2.1"
+#define SCHEMA_VERSION "3"
 
 static const char * rootdir = NULL;
 FILE * logfile = NULL;
@@ -85,31 +85,92 @@ std::vector<const char *> proc_file_content;
 #define PENDING_MAX_SIZE (2*1024)
 #define PENDING_FH_START 4000000000u
 
-bool db_locked = false;
-
 struct ScopedMutex {
   pthread_mutex_t * mutex;
   bool locked;
-  ScopedMutex(pthread_mutex_t * m) : mutex(m), locked(false) {lock();}
+  ScopedMutex(pthread_mutex_t * m, bool start_locked = true) : mutex(m), locked(false) {if (start_locked) lock();}
   ScopedMutex(ScopedMutex && other) : mutex(other.mutex), locked(other.locked) {other.mutex = NULL;}
   ScopedMutex & operator=(ScopedMutex & other) = delete;
   ~ScopedMutex() {if (mutex) unlock();}
-  void unlock() {if (locked && mutex == &db_mutex) db_locked = false; if (locked) pthread_mutex_unlock(mutex); locked = false; }
-  void lock() {if (!locked) pthread_mutex_lock(mutex); locked = true; if (mutex == &db_mutex) db_locked = true; }
+  //void unlock() {if (locked && mutex == &db_mutex) db_locked = false; if (locked) pthread_mutex_unlock(mutex); locked = false; }
+  //void lock() {if (!locked) pthread_mutex_lock(mutex); locked = true; if (mutex == &db_mutex) db_locked = true; }
+  void unlock() {if (locked) pthread_mutex_unlock(mutex); locked = false; }
+  void lock() {if (!locked) pthread_mutex_lock(mutex); locked = true; }
+  void yield () {assert(locked); unlock(); lock(); }
+
 };
 struct DbMutex : public ScopedMutex {
-  DbMutex() : ScopedMutex(&db_mutex) {}
+  DbMutex(bool start_locked = true) : ScopedMutex(&db_mutex, start_locked) {}
 };
 bool exiting = false;
-bool global_more_to_do = false;
-bool uploader_waiting = false;
-pthread_cond_t uploader_cond = PTHREAD_COND_INITIALIZER;
-static void notify_uploader() {
-  global_more_to_do = true;
-  if (!uploader_waiting) return;
-  pthread_cond_signal(&uploader_cond);
-  uploader_waiting = false;
-}
+
+class Worker {
+public:
+  const char * worker_name;
+  pthread_t thread;
+  pthread_cond_t cond;
+  void * start();
+  void notify() {
+    assert(db_locked);
+    more_to_do_now = true;
+    if (!waiting) return;
+    pthread_cond_signal(&cond);
+    waiting = false;
+  }
+protected:
+  bool waiting;
+  bool more_to_do_now;
+  int more_to_do;
+  int error_backoff;
+  DbMutex lock;
+  virtual bool do_work() = 0; // returns true if the function should
+			      // be called again without waiting
+  Worker(const char * name) 
+    : worker_name(name), cond(PTHREAD_COND_INITIALIZER), 
+      waiting (false), more_to_do_now(false), more_to_do(), error_backoff(), lock(false) {}
+
+public:
+  void create() {
+    pthread_create(&thread, NULL, thread_start, this);
+  }
+
+  static void * thread_start(void *);
+};
+
+// The checksum thread computes checksums for modified files
+class LocalPartThread : public Worker {
+public:
+  LocalPartThread() : Worker("local part thread") {}
+protected:
+  bool do_work();
+} * local_part_thread = NULL;
+
+// The cleanup thread removes files locally that are no longer needed
+// and also upload files, giving priority to files that could be
+// removed after uploading
+class UploaderThread : public Worker {
+public:
+  UploaderThread() : Worker("uploader thread") {}
+protected:
+  bool do_work();
+} * uploader_thread =  NULL;
+
+// The extra_uploader thread is an optional thread that uploads files
+// giving priority to smaller files
+class ExtraUploaderThread : public Worker {
+public:
+  ExtraUploaderThread() : Worker("extra uploader thread") {}
+protected:
+  bool do_work();
+} * extra_uploader_thread =  NULL;
+
+// The metadata thread pushes other changes not handled by other threads
+class MetadataThread : public Worker {
+public:
+  MetadataThread() : Worker("metadata thread") {}
+protected:
+  bool do_work();
+} * metadata_thread = NULL;
 
 void log_msg(const char *format, ...)
   __attribute__ ((format (printf, 1, 2)));
@@ -352,6 +413,13 @@ const char * fileinfo_sql =
   "  cid integer not null primary key, /* content id */"
   "  checksum text,"
   "  size int"
+  ");"
+  "drop table if exists in_progress; "
+  "create table in_progress ("
+  "  fid integer not null primary key, "
+  "  action string, "
+  "  new_cid integer, "
+  "  new_path integer "
   ");"
   "insert into contentinfo (cid) values (10000);" // for debugging to make sure we don't get fid and cid mixed up
 ;
@@ -598,7 +666,7 @@ int syncfs_unlink(const char *path)
     }
 
     sql_unlink.exec1(Path(path));
-    notify_uploader();
+    metadata_thread->notify();
 
     return 0;
 
@@ -674,7 +742,7 @@ int syncfs_rename(const char *path, const char *newpath)
     }
 
     trans.commit();
-    notify_uploader();
+    metadata_thread->notify();
 
     return 0;
 
@@ -900,7 +968,7 @@ int syncfs_release(const char * path, struct fuse_file_info *fi)
   if (retstat != 0)
     return syncfs_error("syncfs_release close");
 
-  notify_uploader();
+  local_part_thread->notify();
 
   return 0;
 }
@@ -1102,12 +1170,18 @@ int syncfs_truncate(const char *path, off_t newsize)
 // Startup and Shutdown operations
 //
 
-/* Initialize filesystem */
-pthread_t uploader_thread;
 void * uploader(void *);
 void *syncfs_init(struct fuse_conn_info *conn)
 {
-  pthread_create(&uploader_thread, NULL, uploader, NULL);
+  local_part_thread = new LocalPartThread();
+  uploader_thread = new UploaderThread();
+  extra_uploader_thread = new ExtraUploaderThread();
+  metadata_thread = new MetadataThread();
+
+  local_part_thread->create();
+  uploader_thread->create();
+  extra_uploader_thread->create();
+  metadata_thread->create();
     
   log_msg("\nsyncfs_init()\n");
     
@@ -1123,9 +1197,17 @@ void syncfs_destroy(void *userdata)
   {
     DbMutex lock;
     exiting = true;
-    notify_uploader();
+    local_part_thread->notify();
+    uploader_thread->notify();
+    if (extra_uploader_thread)
+      extra_uploader_thread->notify();
+    metadata_thread->notify();
   }
-  pthread_join(uploader_thread, NULL);
+  pthread_join(metadata_thread->thread, NULL);
+  pthread_join(uploader_thread->thread, NULL);
+  if (extra_uploader_thread)
+    pthread_join(extra_uploader_thread->thread, NULL);
+  pthread_join(metadata_thread->thread, NULL);
   close_db();
   log_msg("    All done, EXITING\n");
 }
@@ -1203,7 +1285,7 @@ int fetch_path(const char * fpath, FileId fid, DbMutex & lock) {
   } else {
     sql_mark_downloading.exec1(fid);
     lock.unlock();
-    log_msg("*** downloading %s\n", fpath);
+    log_msg("*** DOWNLOADING %s\n", fpath);
     int tries = 1;
   again:
     int ret = remote.download(&remote_state, remote_path.c_str(), fpath);
@@ -1215,7 +1297,7 @@ int fetch_path(const char * fpath, FileId fid, DbMutex & lock) {
       remote.checksum(&remote_state, fpath, &checksum);
       if (/*size != expected_size || */expected_checksum != checksum) {
         if (tries < 2) {
-          log_msg("*** error: size of checksum don't match, retrying in 10 seconds: %s\n", fpath);
+          log_msg("*** error: size or checksum don't match, retrying in 10 seconds: %s\n", fpath);
           tries++;
           unlink(fpath);
           sleep(10);
@@ -1239,15 +1321,9 @@ int fetch_path(const char * fpath, FileId fid, DbMutex & lock) {
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// Background uploader
+// Background tasks
 //
 
-// Action twiplet
-//   delete cid remote_path
-//   rename cid remote_path new_path
-//   upload cid remote_path
-
-//   existing_cid,path,rename_to,upload_cid
 
 const char * uploader_views =
   "drop view if exists want_to_remove;"
@@ -1261,8 +1337,9 @@ const char * uploader_views =
   "    dir is not null and checksum is not null and (remote_cid is null or cid != remote_cid) as to_upload, "
   "    coalesce(dir||name != remote_path,0) as to_rename, "
   "    (select fid from fileinfo where fid != f.fid and f.dir||f.name = remote_path) as blocked_by, "
+  "    size, "
   "    case when dir is null then 0 else size end - case when remote_path is null then 0 else r_size end as size_delta "
-  "  from fileinfo f left join contentinfo using (cid) left join (select cid as remote_cid, size as r_size from contentinfo) using (remote_cid);"
+  "  from fileinfo f left join contentinfo using (cid) left join (select cid as remote_cid, size as r_size from contentinfo) using (remote_cid); "
   ;
 
 SqlSelect sql_same_content("select 1 from fileinfo where fid = ? and cid = ?");
@@ -1279,35 +1356,53 @@ SqlSelect sql_want_to_remove("select * from want_to_remove order by round(size/1
 SqlStmt sql_mark_removed("update fileinfo set local=0 where fid=?");
 SqlStmt sql_mark_never_remove("update fileinfo set keep_local=1 where fid=?");
 
-SqlSelect sql_pending("select * from pending where to_delete or to_rename or to_upload");
+SqlSelect sql_to_upload("select fid from pending where to_upload order by size desc");
+SqlSelect sql_to_upload_also("select fid from pending where to_upload order by size");
+SqlSelect sql_metadata_to_push("select fid,to_delete,to_rename from pending where to_delete or to_rename");
 
-SqlSelect sql_to_delete_check("select coalesce(remote_id,remote_path),size_delta from pending join fileinfo using (fid) where to_delete and fid = ?");
-SqlSelect sql_to_rename_check("select remote_id,remote_path, dir||name as path,mtime,blocked_by from pending join fileinfo using (fid) where to_rename and fid = ?");
-SqlSelect sql_to_upload_check("select cid,remote_id,remote_path,dir||name as path,mtime,atime,size,checksum,blocked_by,size_delta from pending join fileinfo using (fid) join contentinfo using (cid) where to_upload and fid = ?");
+SqlSelect sql_to_delete_check("select coalesce(remote_id,remote_path),size_delta,action is not null as in_progress "
+			      "from pending join fileinfo using (fid) left join in_progress using (fid) "
+			      "where to_delete and fid = ?");
+SqlSelect sql_to_rename_check("select remote_id,remote_path, dir||name as path,mtime,blocked_by,action is not null as in_progress "
+			      "from pending join fileinfo f using (fid) left join in_progress using (fid) "
+			      "where to_rename and fid = ?");
+SqlSelect sql_to_upload_check("select cid,remote_id,remote_path,dir||name as path,mtime,atime,l.size,checksum,blocked_by,size_delta,action is not null as in_progress "
+			      "from pending join fileinfo using (fid) join contentinfo l using (cid) left join in_progress using (fid) "
+			      "where to_upload and fid = ?");
 
 SqlStmt sql_mark_deleted("update fileinfo set remote_id = null, remote_path = null, remote_failures = 0 where fid = ?");
 SqlStmt sql_mark_renamed("update fileinfo set remote_path = ? where fid = ?");
 SqlStmt sql_mark_uploaded("update fileinfo set remote_cid = ?, remote_path = ?, remote_failures = 0 where fid = ?");
 SqlStmt sql_assign_remote_id("update fileinfo set remote_id = ? where fid = ?");
 
+SqlStmt sql_mark_in_progress("insert into in_progress (fid, action, new_cid, new_path) values (?,?,?,?)");
+SqlStmt sql_clear_in_progress("delete from in_progress where fid = ?");
+
 SqlStmt sql_mark_failure("update fileinfo set remote_failures = remote_failures + 1 where fid = ?");
 SqlStmt sql_mark_bad_upload("update fileinfo set remote_cid = NULL, remote_path = ? where fid = ?");
 
 SqlSelect sql_file_exists("select 1 from fileinfo where dir=? and name=?");
 
-void uploader_localpart(int & more_to_do, DbMutex & lock, std::vector<FileId> * want_to_remove = NULL) {
+struct Fail {}; // thrown on remote failure
+struct Exit {}; // thrown to exit thread
+
+struct OpRes {
+  bool did_something;
+  ssize_t remote_space_change;
+};
+
+OpRes do_delete(FileId fid, int & more_to_do, time_t now, DbMutex & lock);
+bool do_rename(FileId fid, int & more_to_do, time_t now, DbMutex & lock);
+OpRes do_upload(FileId fid, int & more_to_do, time_t now, DbMutex & lock);
+
+vector<FileId> want_to_remove;
+
+bool LocalPartThread::do_work() {
+  assert(lock.locked);
   time_t now = time(NULL);
-  std::vector<FileId> need_checksum;
-  lock.lock();
-  // Collect any files that need to be checksumed
-  auto res = sql_need_checksum();
-  while (res.step()) {
-    FileId fid;
-    res.get(fid);
-    need_checksum.push_back(fid);
-  }
   // Delete any local files that are already upload and can be removed
-  res = sql_want_to_remove();
+  want_to_remove.clear();
+  auto res = sql_want_to_remove();
   while (res.step()) {
     FileId fid;
     const char * path;
@@ -1324,16 +1419,28 @@ void uploader_localpart(int & more_to_do, DbMutex & lock, std::vector<FileId> * 
     } else if (may_remove) {
       char fpath[PATH_MAX];
       syncfs_fullpath(fpath, path);
-      log_msg("*** removing local copy of %s\n", path);
+      log_msg("*** REMOVING local copy of %s\n", path);
       unlink(fpath);
       sql_mark_removed.exec1(fid);
-    } else if (want_to_remove != NULL) {
+    } else {
       log_msg("--- want to remove but can't %s\n", path);
-      want_to_remove->push_back(fid);
+      want_to_remove.push_back(fid);
     }
   }
+  if (!want_to_remove.empty())
+    uploader_thread->notify();
+  lock.yield();
+  // Collect any files that need to be checksumed
+  std::vector<FileId> need_checksum;
+  res = sql_need_checksum();
+  while (res.step()) {
+    FileId fid;
+    res.get(fid);
+    need_checksum.push_back(fid);
+  }
+  res.reset();
   for (auto fid : need_checksum) {
-    lock.lock();
+    if (exiting) throw Exit();
     auto res = sql_checksum_check(fid);
     if (!res.step()) continue;
     ContentId cid;
@@ -1343,12 +1450,14 @@ void uploader_localpart(int & more_to_do, DbMutex & lock, std::vector<FileId> * 
     lock.unlock();
     char fpath[PATH_MAX];
     syncfs_fullpath(fpath, path.c_str());
-    log_msg("*** checksumming %s\n", fpath);
+    log_msg("*** CHECKSUMMING %s\n", fpath);
     CheckSum checksum;
     int ret = remote.checksum(&remote_state, fpath, &checksum);
     lock.lock();
+    // FIXME: Also need to make sure the file was not deleted on us
+    //  maybe this should be folded into same_content, not sure
     if (!same_content(fid,cid)) continue;
-    // all good, let's continue
+      // all good, let's continue
     if (ret != 0) {
       // this should not happen and if does we can't really continue
       // so just exit
@@ -1357,120 +1466,96 @@ void uploader_localpart(int & more_to_do, DbMutex & lock, std::vector<FileId> * 
     }
     sql_set_checksum.exec1(checksum.hex, cid);
   }
+  uploader_thread->notify();
+  if (extra_uploader_thread)
+    extra_uploader_thread->notify();
+  return false;
 }
 
-struct Fail {};
-struct Exit {};
+bool UploaderThread::do_work() {
+  assert(lock.locked);
+  time_t now = time(NULL);
+  vector<FileId> want_to_remove = ::want_to_remove;
 
-struct OpRes {
-  bool did_something;
-  ssize_t remote_space_change;
-};
-
-OpRes do_delete(FileId fid, int & more_to_do, time_t now, DbMutex & lock);
-bool do_rename(FileId fid, int & more_to_do, time_t now, DbMutex & lock);
-OpRes do_upload(FileId fid, int & more_to_do, time_t now, DbMutex & lock);
-
-void * uploader(void *) {
-  log_msg("*** starting uploader\n");
-  using std::vector;
-  using std::string;
-  int more_to_do = 0;
-  int error_backoff = MIN_BACKOFF_ERROR;
-  //int remote_space_to_recover = 0;
-  DbMutex lock;
- loop: try {
-    lock.lock();
-    more_to_do = INT_MAX;
-    log_msg("*** starting uploader iteration\n");
-    global_more_to_do = false;
-    if (exiting) return NULL;
-    auto handle_local_part = [&]() {
-    again:
+  // Upload a single file that could be removed if upload
+  for (auto fid : want_to_remove) {
+    auto res = do_upload(fid, more_to_do, now, lock);
+    if (res.did_something) {
       lock.lock();
-      vector<FileId> want_to_remove;
-      uploader_localpart(more_to_do, lock, &want_to_remove);
-      if (exiting) throw Exit();
-      time_t now = time(NULL);
-      for (auto fid : want_to_remove) {
-	auto res = do_upload(fid, more_to_do, now, lock);
-	if (res.did_something) {
-	  error_backoff = MIN_BACKOFF_ERROR;
-	  goto again;
-	}
-      }
-    };
-    handle_local_part();
-    time_t now = time(NULL);
-    vector<FileId> to_delete;
-    vector<FileId> to_upload; 
-    vector<FileId> to_rename;
-    lock.lock();
-    auto res = sql_pending();
-    while (res.step()) {
-      FileId fid;
-      bool to_del,to_upld,to_renm;
-      res.get(fid, to_del,to_upld,to_renm);
-      if (to_del)
-	to_delete.push_back(fid);
-      else if (to_upld) // note, some files can be both uploaded and
-	// renamed in which case only do the upload
-	to_upload.push_back(fid);
-      else if (to_renm)
-	to_rename.push_back(fid);
+      local_part_thread->notify();
+      error_backoff = MIN_BACKOFF_ERROR;
+      return true;
     }
-    res.reset();
-    lock.unlock();
-    for (auto fid : to_delete) {
-      handle_local_part();
-      auto res = do_delete(fid, more_to_do, now, lock);
-      if (res.did_something) error_backoff = MIN_BACKOFF_ERROR;
-    }
-    for (auto fid : to_rename) {
-      handle_local_part();
-      bool did_something = do_rename(fid, more_to_do, now, lock);
-      if (did_something) error_backoff = MIN_BACKOFF_ERROR;
-    }
-    for (auto fid : to_upload) {
-      handle_local_part();
-      auto res = do_upload(fid, more_to_do, now, lock);
-      if (res.did_something) error_backoff = MIN_BACKOFF_ERROR;
-    }
-    lock.lock();
-    if (exiting) return NULL;
-    uploader_waiting = true;
-    error_backoff = MIN_BACKOFF_ERROR;
-    if (global_more_to_do) {
-      log_msg("*** still more to do ...\n");
-      /* don't wait */
-    } else if (more_to_do < INT_MAX) {
-      log_msg("*** more to do, waiting %d seconds\n", more_to_do);
-      struct timespec wait_until;
-      clock_gettime(CLOCK_REALTIME, &wait_until);
-      wait_until.tv_sec += more_to_do;
-      pthread_cond_timedwait(&uploader_cond, &db_mutex, &wait_until);
-    } else {
-      log_msg("*** all done, waiting for something to do\n");
-      pthread_cond_wait(&uploader_cond, &db_mutex);
-    }
-  } catch (Fail) {
-    log_msg("*** error, waiting %d seconds and trying again\n", error_backoff);
-    struct timespec wait_until, now;
-    clock_gettime(CLOCK_REALTIME, &wait_until);
-    wait_until.tv_sec += error_backoff;
-      do {
-	lock.lock();
-        uploader_waiting = true;
-        pthread_cond_timedwait(&uploader_cond, &db_mutex, &wait_until);
-        if (exiting) return NULL;
-	uploader_localpart(more_to_do, lock);
-        clock_gettime(CLOCK_REALTIME, &now);
-      } while (now.tv_sec <wait_until.tv_sec);
-      error_backoff = std::min(error_backoff * 2, MAX_BACKOFF_ERROR);
-  } catch (Exit) {
-    return NULL;
   }
-  goto loop;
+
+  // If we still did not do anything upload a single file
+  vector<FileId> to_upload;
+  lock.lock();
+  auto res = sql_to_upload();
+  while (res.step()) {
+    FileId fid;
+    res.get(fid);
+    to_upload.push_back(fid);
+  }
+  res.reset();
+  lock.unlock();
+  for (auto fid : to_upload) {
+    auto res = do_upload(fid, more_to_do, now, lock);
+    if (res.did_something) {
+      error_backoff = MIN_BACKOFF_ERROR;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool ExtraUploaderThread::do_work() {
+  assert(lock.locked);
+  time_t now = time(NULL);
+  vector<FileId> to_upload;
+  auto res = sql_to_upload_also();
+  while (res.step()) {
+    FileId fid;
+    res.get(fid);
+    to_upload.push_back(fid);
+  }
+  res.reset();
+  lock.unlock();
+  for (auto fid : to_upload) {
+    auto res = do_upload(fid, more_to_do, now, lock);
+    if (res.did_something) {
+      error_backoff = MIN_BACKOFF_ERROR;
+    }
+  }
+  return false;
+}
+
+bool MetadataThread::do_work() {
+  assert(lock.locked);
+  time_t now = time(NULL);
+  vector<FileId> to_delete;
+  vector<FileId> to_rename;
+  auto res = sql_metadata_to_push();
+  while (res.step()) {
+    FileId fid;
+    bool to_del,to_renm;
+    res.get(fid,to_del,to_renm);
+    if (to_del)
+      to_delete.push_back(fid);
+    else if (to_renm)
+      to_rename.push_back(fid);
+  }
+  res.reset();
+  lock.unlock();
+  for (auto fid : to_delete) {
+    auto res = do_delete(fid, more_to_do, now, lock);
+    if (res.did_something) error_backoff = MIN_BACKOFF_ERROR;
+  }
+  for (auto fid : to_rename) {
+    bool did_something = do_rename(fid, more_to_do, now, lock);
+    if (did_something) error_backoff = MIN_BACKOFF_ERROR;
+  }
+  return false;
 }
 
 OpRes do_delete(FileId fid, int & more_to_do, time_t now, DbMutex & lock) {
@@ -1483,7 +1568,7 @@ OpRes do_delete(FileId fid, int & more_to_do, time_t now, DbMutex & lock) {
   res.get(remote_id_path,size_delta);
   res.reset();
   lock.unlock();
-  log_msg("*** deleting %s\n", remote_id_path.c_str());
+  log_msg("*** DELETING %s\n", remote_id_path.c_str());
   int ret = remote.del(&remote_state, remote_id_path.c_str());
   lock.lock();
   if (ret != 0) {sql_mark_failure.exec1(fid); throw Fail();}
@@ -1499,8 +1584,9 @@ bool do_rename(FileId fid, int & more_to_do, time_t now, DbMutex & lock) {
   string remote_id,remote_path,path;
   time_t mtime;
   FileId blocked_by;
-  res.get(remote_id,remote_path,path,mtime,blocked_by);
-  if (blocked_by != 0) {
+  bool in_progress;
+  res.get(remote_id,remote_path,path,mtime,blocked_by,in_progress);
+  if (blocked_by != 0 || in_progress) {
     more_to_do = std::min(more_to_do, 1);
     return false;
   }
@@ -1508,10 +1594,12 @@ bool do_rename(FileId fid, int & more_to_do, time_t now, DbMutex & lock) {
   if (remote_id.empty()) 
     remote_id = remote_path;
   res.reset();
+  sql_mark_in_progress.exec1(fid, "rename", 0, path.c_str());
   lock.unlock();
-  log_msg("*** renaming %s -> %s\n", remote_path.c_str(), path.c_str());
+  log_msg("*** RENAMING %s -> %s\n", remote_path.c_str(), path.c_str());
   int ret = remote.rename(&remote_state, remote_id.c_str(), path.c_str(), mtime);
   lock.lock();
+  sql_clear_in_progress.exec1(fid);
   if (ret != 0) {sql_mark_failure.exec1(fid); throw Fail();}
   sql_mark_renamed.exec1(path.c_str(), fid);
   return true;
@@ -1529,8 +1617,9 @@ OpRes do_upload(FileId fid, int & more_to_do, time_t now, DbMutex & lock) {
   const char * checksum_str;
   FileId blocked_by;
   int size_delta;
-  res.get(cid0,remote_id,remote_path,path,mtime,atime,size,checksum_str,blocked_by,size_delta);
-  if (blocked_by != 0) {
+  bool in_progress;
+  res.get(cid0,remote_id,remote_path,path,mtime,atime,size,checksum_str,blocked_by,size_delta,in_progress);
+  if (blocked_by != 0 || in_progress) {
     more_to_do = std::min(more_to_do, 1);
     return {false, 0};
   }
@@ -1543,8 +1632,9 @@ OpRes do_upload(FileId fid, int & more_to_do, time_t now, DbMutex & lock) {
     return {false, 0};
   }
   res.reset();
+  sql_mark_in_progress.exec1(fid, "upload", cid0, path.c_str());
   lock.unlock();
-  log_msg("*** uploading %s\n", path.c_str());
+  log_msg("*** UPLOADING %s\n", path.c_str());
   int ret;
   char id[256] = "";
   CheckSum checksum;
@@ -1556,16 +1646,17 @@ OpRes do_upload(FileId fid, int & more_to_do, time_t now, DbMutex & lock) {
     ret = remote.replace(&remote_state, fpath, remote_id.c_str(), &checksum);
   }
   lock.lock();
+  sql_clear_in_progress.exec1(fid);
   if (ret != 0) {sql_mark_failure.exec1(fid); throw Fail();}
   if (id[0] != '\0')
     sql_assign_remote_id.exec1(id, fid);
   if (!same_content(fid,cid0)) {
-    log_msg("*** file changed from under us, marking upload as bad %s\n", path.c_str());
+    log_msg("*** WARNING file changed from under us, marking upload as bad %s\n", path.c_str());
     sql_mark_bad_upload.exec1(path.c_str(), fid); 
     throw Fail();
   }
   if (checksum != local_checksum) {
-    log_msg("*** checksum mismatch after upload on path %s\n", path.c_str());
+    log_msg("*** WARNING checksum mismatch after upload on path %s\n", path.c_str());
     sql_mark_bad_upload.exec1(path.c_str(), fid); 
     throw Fail();
   } else {
@@ -1575,6 +1666,65 @@ OpRes do_upload(FileId fid, int & more_to_do, time_t now, DbMutex & lock) {
   more_to_do = std::min(more_to_do, REMOVE_WAIT);
   return {true, size_delta};
 }
+
+void * Worker::start() {
+  log_msg("*** %s: starting\n", worker_name);
+  lock.lock();
+  more_to_do = INT_MAX;
+  error_backoff = MIN_BACKOFF_ERROR;
+ loop: try {
+    log_msg("*** %s: new iteration\n", worker_name);
+    more_to_do = INT_MAX;
+    more_to_do_now = false;
+    if (exiting) throw Exit();
+
+    bool again = do_work();
+    lock.lock(); // make sure we are still locked
+
+    if (exiting) throw Exit();
+    waiting = true;
+    error_backoff = MIN_BACKOFF_ERROR;
+    if (more_to_do_now || again) {
+      log_msg("*** %s: still more to do ...\n", worker_name);
+      /* don't wait, but give other threads that are waiting on the lock a turn */
+      lock.yield();
+    } else if (more_to_do < INT_MAX) {
+      log_msg("*** %s: more to do, waiting %d seconds\n", worker_name, more_to_do);
+      struct timespec wait_until;
+      clock_gettime(CLOCK_REALTIME, &wait_until);
+      wait_until.tv_sec += more_to_do;
+      pthread_cond_timedwait(&cond, &db_mutex, &wait_until);
+    } else {
+      log_msg("*** %s: all done, waiting for something to do\n", worker_name);
+      pthread_cond_wait(&cond, &db_mutex);
+    }
+  } catch (Fail) {
+    log_msg("*** %s: error, waiting %d seconds and trying again\n", worker_name, error_backoff);
+    struct timespec wait_until, now;
+    clock_gettime(CLOCK_REALTIME, &wait_until);
+    wait_until.tv_sec += error_backoff;
+    do {
+      lock.lock();
+      waiting = true;
+      pthread_cond_timedwait(&cond, &db_mutex, &wait_until);
+      if (exiting) goto exit;
+      clock_gettime(CLOCK_REALTIME, &now);
+    } while (now.tv_sec <wait_until.tv_sec);
+    error_backoff = std::min(error_backoff * 2, MAX_BACKOFF_ERROR);
+  } catch (Exit) {
+    goto exit;
+  }
+  goto loop;
+ exit:
+  log_msg("*** %s: exiting\n", worker_name);
+  return NULL;
+}
+
+void * Worker::thread_start(void * ptr) {
+  auto ths = static_cast<Worker *>(ptr);
+  return ths->start();
+}
+
 
 //////////////////////////////////////////////////////////////////////////////
 //

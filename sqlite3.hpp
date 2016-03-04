@@ -4,7 +4,18 @@
 
 #include <sqlite3.h>
 
-extern bool db_locked;
+#ifdef DEBUG_LOCKS
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <sys/types.h>
+extern pthread_mutex_t db_mutex;
+#define db_locked (db_mutex.__data.__owner == syscall(SYS_gettid))
+#else
+#define db_locked true
+#endif
+
 extern sqlite3 *db;
 extern std::vector<class SqlStmtBase *> sql_stmts;
 
