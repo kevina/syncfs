@@ -117,20 +117,22 @@ public:
 
 class SqlResult {
 public:
-  SqlResult() : db(), stmt() {}
-  SqlResult(sqlite3 * db, sqlite3_stmt * stmt) : db(db), stmt(stmt) {}
+  SqlResult() : db(), stmt(), step_called(false) {}
+  SqlResult(sqlite3 * db, sqlite3_stmt * stmt) : db(db), stmt(stmt), step_called(false) {}
   SqlResult(SqlResult && other) 
-    : db(other.db), stmt(other.stmt) {other.stmt = NULL;}
+    : db(other.db), stmt(other.stmt), step_called(other.step_called) {other.stmt = NULL;}
   SqlResult & operator=(SqlResult && other) {
     reset();
     db = other.db;
     stmt = other.stmt;
+    step_called = other.step_called;
     other.stmt = NULL;
     return *this;
   }
   bool step() {
     assert(db_locked);
     int res = sqlite3_step(stmt);
+    step_called = true;
     if (res == SQLITE_DONE) return false;
     if (res == SQLITE_ROW) return true;
     else throw SqlError(res, db);
@@ -140,7 +142,11 @@ public:
     get_column(idx, arg);
     get0(idx + 1, args...);
   }
-  template<typename... Ts> void get(Ts & ... args) {get0(0, args...);}
+  template<typename... Ts> void get(Ts & ... args) {
+    if (!step_called)
+      if (!step()) throw SqlError("Query did not return any result.");
+    get0(0, args...);
+  }
   void reset() {
     if (stmt) {
       assert(db_locked);
@@ -155,6 +161,7 @@ public:
 protected:
   sqlite3 * db;
   sqlite3_stmt * stmt;
+  bool step_called;
   void get_column(int idx, const char * & val) {val = (const char *)sqlite3_column_text(stmt, idx);};
   void get_column(int idx, std::string & val) {
     auto val0 = (const char *)sqlite3_column_text(stmt, idx);
@@ -180,19 +187,9 @@ public:
     return exec0(idx, args...);
   }
   template<typename... Ts> SqlResult operator() (Ts... args) {prepare(); return exec0(1, args...);}
-};
 
-class SqlSingle : public SqlStmtBase {
-public:
-  SqlSingle(const char * sql) : SqlStmtBase(sql) {}
-  void exec0(int) {}
-  template<typename T, typename... Ts> void exec0(int idx, T arg, Ts... args) {
-    int res = bind(idx, arg);
-    if (res != 0) throw SqlError(res, db);
-    exec0(idx, args...);
-  }
-  template<typename... Ts> SqlSingle & operator() (Ts... args) {prepare(); exec0(1, args...); return *this;}
   template<typename... Ts> void get(Ts & ... args) {
+    operator()();
     auto res = SqlResult(db, stmt);
     if (!res.step()) throw SqlError(std::string("Query did not return any result: ") + sql);
     res.get(args...);

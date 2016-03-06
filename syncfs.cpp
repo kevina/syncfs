@@ -630,8 +630,8 @@ int syncfs_fsync(const char *, int datasync, struct fuse_file_info *fi)
 // Operations that involve the database
 //
 
-SqlSingle sql_get_fid("select fid from fileinfo where dir=? and name =?");
-SqlSingle sql_is_local("select local from fileinfo where dir=? and name=?");
+SqlSelect sql_get_fid("select fid from fileinfo where dir=? and name =?");
+SqlSelect sql_is_local("select local from fileinfo where dir=? and name=?");
 
 /** Remove a file */
 SqlStmt sql_unlink("update fileinfo set dir=NULL, name=NULL, local=NULL where dir=? and name=?");
@@ -765,7 +765,7 @@ SqlStmt sql_open_file("update fileinfo set opened=max(?1,opened),open_count=open
 SqlStmt sql_create("insert into fileinfo (dir, name, local, mtime, atime, opened, open_count, writable) values (?1,?2,1,?3,?3,2,1,?4)");
 SqlStmt sql_mark_dirty("update fileinfo set cid=NULL where fid=?"); 
 // ^ dirty = file being modified and should be be uploaed until closed
-SqlSingle sql_get_open_count("select open_count,opened from fileinfo where fid=?");
+SqlSelect sql_get_open_count("select open_count,opened from fileinfo where fid=?");
 SqlStmt sql_close_file("update fileinfo set open_count = open_count -1, atime=? where fid=?");
 SqlStmt sql_release_file("update fileinfo set opened=0, open_count = 0, atime=? where fid=?");
 SqlStmt sql_new_cid("insert into contentinfo (size) values (?)");
@@ -1266,7 +1266,7 @@ struct DownloadCond {
 };
 DownloadCond * DownloadCond::head = NULL; 
 
-SqlSingle sql_download_info("select coalesce(remote_id,remote_path),downloading,mtime,size,checksum from fileinfo join contentinfo using (cid) "
+SqlSelect sql_download_info("select coalesce(remote_id,remote_path),downloading,mtime,size,checksum from fileinfo join contentinfo using (cid) "
                             "where fid=? and remote_path is not null");
 SqlStmt sql_mark_downloading("update fileinfo set local=0, downloading=1 where fid=?");
 SqlStmt sql_mark_downloaded("update fileinfo set local=?, downloading=0 where fid=?");
@@ -2175,11 +2175,11 @@ void populate_db(PopulateAction action, bool noop, bool verbose) {
     get_local_listing(fpath, strlen(fpath)-1);
     remote.list(&remote_state, remote_listing_callback, NULL);
     bool database_empty;
-    SqlSingle("select count(*) == 0 from fileinfo")().get(database_empty);
+    SqlSelect("select count(*) == 0 from fileinfo").get(database_empty);
     bool local_empty;
-    SqlSingle("select count(*) == 0 from local")().get(local_empty);
+    SqlSelect("select count(*) == 0 from local").get(local_empty);
     bool remote_empty;
-    SqlSingle("select count(*) == 0 from remote")().get(remote_empty);
+    SqlSelect("select count(*) == 0 from remote").get(remote_empty);
     if (action == SyncToRemote) {
       printf("Sync. to remote...\n");
       sync_to_remote(noop, verbose);
@@ -2358,7 +2358,7 @@ void init_db(const char * dir, bool reset_db) {
       sqlite3_trace(db, sql_trace, NULL);
     sql_exec("PRAGMA synchronous = NORMAL"); // we can rebuild on an os crash
     bool need_tables;
-    SqlSingle("select count(*) ==0 from sqlite_master where name='fileinfo'")().get(need_tables);
+    SqlSelect("select count(*) ==0 from sqlite_master where name='fileinfo'").get(need_tables);
     if (need_tables || reset_db)
       sql_exec(fileinfo_sql);
     sql_exec(uploader_views);
