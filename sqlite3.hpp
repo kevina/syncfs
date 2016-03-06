@@ -43,52 +43,50 @@ struct SqlError {
   SqlError & w_query(std::string && q) {msg = '"' + q + "\": " + msg; return *this;}
 };
 
+struct SqlStmtInfo {
+  const char * const sql;
+  sqlite3_stmt * stmt;
+};
+
 class SqlStmtBase {
 public:
-  SqlStmtBase(const char * sql) : sql(sql), stmt(NULL) {
-    sql_stmts.push_back(this);
-  }
-  SqlStmtBase(const SqlStmtBase &) = delete;
-  void operator=(const SqlStmtBase &) = delete;
-  ~SqlStmtBase() {
-    auto pos = std::find(sql_stmts.begin(), sql_stmts.end(), this);
-    sql_stmts.erase(pos);
-  }
+  SqlStmtBase(const char * sql) : inf(new SqlStmtInfo{sql, NULL}) {}
+  SqlStmtBase(SqlStmtInfo * i) : inf(i) {}
   void prepare() {
     assert(db_locked);
-    if (stmt == NULL) {
-      int res = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
-      if (res != 0) throw SqlError(res, db).w_query(sql);
+    if (inf->stmt == NULL) {
+      int res = sqlite3_prepare_v2(db, inf->sql, -1, &inf->stmt, NULL);
+      if (res != 0) throw SqlError(res, db).w_query(inf->sql);
     }
   }
-  const char * const sql;
+  SqlStmtInfo * const inf;
 protected:
-  sqlite3_stmt * stmt;
-  int bind(int & idx, int val) {return sqlite3_bind_int(stmt, idx++, val);}
-  int bind(int & idx, long int val) {return sqlite3_bind_int64(stmt, idx++, val);}
-  int bind(int & idx, long long int val) {return sqlite3_bind_int64(stmt, idx++, val);}
-  int bind(int & idx, const char * val) {return sqlite3_bind_text(stmt, idx++, val, -1, SQLITE_STATIC);};
+  int bind(int & idx, int val) {return sqlite3_bind_int(inf->stmt, idx++, val);}
+  int bind(int & idx, long int val) {return sqlite3_bind_int64(inf->stmt, idx++, val);}
+  int bind(int & idx, long long int val) {return sqlite3_bind_int64(inf->stmt, idx++, val);}
+  int bind(int & idx, const char * val) {return sqlite3_bind_text(inf->stmt, idx++, val, -1, SQLITE_STATIC);};
   int bind(int & idx, Path val) {
     const char * pos = strrchr(val.str, '/');
     assert(pos);
     pos++;
-    int res = sqlite3_bind_text(stmt, idx++, val.str, pos - val.str, SQLITE_STATIC);
+    int res = sqlite3_bind_text(inf->stmt, idx++, val.str, pos - val.str, SQLITE_STATIC);
     if (res != 0) return res;
-    return sqlite3_bind_text(stmt, idx++, pos, -1,  SQLITE_STATIC);
+    return sqlite3_bind_text(inf->stmt, idx++, pos, -1,  SQLITE_STATIC);
   }
 };
 
 class SqlStmt : public SqlStmtBase {
 public:
   SqlStmt(const char * sql) : SqlStmtBase(sql) {}
+  SqlStmt(SqlStmtInfo * i) : SqlStmtBase(i) {}
   void exec0(int idx) {
     assert(db_locked);
-    if (idx - 1 != sqlite3_bind_parameter_count(stmt))
-      throw SqlError(std::string("Wrong number of binding parameters for query: ") + sql);
-    int res = sqlite3_step(stmt);
+    if (idx - 1 != sqlite3_bind_parameter_count(inf->stmt))
+      throw SqlError(std::string("Wrong number of binding parameters for query: ") + inf->sql);
+    int res = sqlite3_step(inf->stmt);
     if (res != SQLITE_DONE) throw SqlError(res, db);
-    sqlite3_reset(stmt);
-    sqlite3_clear_bindings(stmt);
+    sqlite3_reset(inf->stmt);
+    sqlite3_clear_bindings(inf->stmt);
   }
   template<typename T, typename... Ts> void exec0(int idx, T arg, Ts... args) {
     int res = bind(idx, arg);
@@ -104,14 +102,14 @@ public:
   template<typename... Ts> void exec(Ts... args) {
     exec_nocheck(args...);
     if (sqlite3_changes(db) <= 0) 
-      throw SqlError(std::string("No rows modifed while executing: ") + sql);
+      throw SqlError(std::string("No rows modifed while executing: ") + inf->sql);
   }
 
   // execite statement, and check that exactly one row was changed
   template<typename... Ts> void exec1(Ts... args) {
     exec(args...);
     if (sqlite3_changes(db) > 1)
-      throw SqlError(std::string("More than one row modifed while executing: ") + sql);
+      throw SqlError(std::string("More than one row modifed while executing: ") + inf->sql);
   }
 };
 
@@ -178,8 +176,9 @@ protected:
 class SqlSelect : public SqlStmtBase {
 public:
   SqlSelect(const char * sql) : SqlStmtBase(sql) {}
+  SqlSelect(SqlStmtInfo * i) : SqlStmtBase(i) {}
   SqlResult exec0(int) {
-    return SqlResult(db, stmt);
+    return SqlResult(db, inf->stmt);
   }
   template<typename T, typename... Ts> SqlResult exec0(int idx, T arg, Ts... args) {
     int res = bind(idx, arg);
@@ -190,8 +189,8 @@ public:
 
   template<typename... Ts> void get(Ts & ... args) {
     operator()();
-    auto res = SqlResult(db, stmt);
-    if (!res.step()) throw SqlError(std::string("Query did not return any result: ") + sql);
+    auto res = SqlResult(db, inf->stmt);
+    if (!res.step()) throw SqlError(std::string("Query did not return any result: ") + inf->sql);
     res.get(args...);
   }
 };

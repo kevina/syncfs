@@ -7,3 +7,7 @@ syncfs
 .\#*
 data/
 mnt/
+sqlite3-pp
+queries-gen.hpp
+syncfs-gen.cpp
+scratch/
