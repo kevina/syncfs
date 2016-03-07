@@ -46,6 +46,7 @@ struct SqlError {
 struct SqlStmtInfo {
   const char * const sql;
   sqlite3_stmt * stmt;
+  int inline_bound;
 };
 
 class SqlStmtBase {
@@ -81,7 +82,7 @@ public:
   SqlStmt(SqlStmtInfo * i) : SqlStmtBase(i) {}
   void exec0(int idx) {
     assert(db_locked);
-    if (idx - 1 != sqlite3_bind_parameter_count(inf->stmt))
+    if (idx - 1 != sqlite3_bind_parameter_count(inf->stmt) - inf->inline_bound)
       throw SqlError(std::string("Wrong number of binding parameters for query: ") + inf->sql);
     int res = sqlite3_step(inf->stmt);
     if (res != SQLITE_DONE) throw SqlError(res, db);
@@ -93,6 +94,32 @@ public:
     if (res != 0) throw SqlError(res, db);
     exec0(idx, args...);
   }
+};
+
+class SqlInsert : public SqlStmt {
+public:
+  SqlInsert(const char * sql) : SqlStmt(sql) {}
+  SqlInsert(SqlStmtInfo * i) : SqlStmt(i) {}
+  // execute statement
+  template<typename... Ts> int64_t exec(Ts... args) {
+    prepare(); 
+    exec0(1, args...);
+    return sqlite3_last_insert_rowid(db);
+  }
+
+  // execite statement, and check that exactly one row was changed
+  template<typename... Ts> int64_t exec1(Ts... args) {
+    exec(args...);
+    if (sqlite3_changes(db) > 1)
+      throw SqlError(std::string("More than one row modifed while executing: ") + inf->sql);
+    return sqlite3_last_insert_rowid(db);
+  }
+};
+
+class SqlOther : public SqlStmt {
+public:
+  SqlOther(const char * sql) : SqlStmt(sql) {}
+  SqlOther(SqlStmtInfo * i) : SqlStmt(i) {}
   // execute statement
   template<typename... Ts> void exec_nocheck(Ts... args) {
     prepare(); 
@@ -130,7 +157,7 @@ public:
   bool step() {
     assert(db_locked);
     int res = sqlite3_step(stmt);
-    step_called = true;
+    step_called = 2;
     if (res == SQLITE_DONE) return false;
     if (res == SQLITE_ROW) return true;
     else throw SqlError(res, db);
@@ -159,7 +186,7 @@ public:
 protected:
   sqlite3 * db;
   sqlite3_stmt * stmt;
-  bool step_called;
+  int8_t step_called; // 0 = step never called, 1 = step called and we got the data, 2 = step called and we didn't get the data
   void get_column(int idx, const char * & val) {val = (const char *)sqlite3_column_text(stmt, idx);};
   void get_column(int idx, std::string & val) {
     auto val0 = (const char *)sqlite3_column_text(stmt, idx);
@@ -173,23 +200,24 @@ protected:
   void get_column(int idx, long long int & val) {val = (long int)sqlite3_column_int64(stmt, idx);};
 };
 
+template <typename Res = SqlResult>
 class SqlSelect : public SqlStmtBase {
 public:
   SqlSelect(const char * sql) : SqlStmtBase(sql) {}
   SqlSelect(SqlStmtInfo * i) : SqlStmtBase(i) {}
-  SqlResult exec0(int) {
-    return SqlResult(db, inf->stmt);
+  Res exec0(int) {
+    return Res(db, inf->stmt);
   }
-  template<typename T, typename... Ts> SqlResult exec0(int idx, T arg, Ts... args) {
+  template<typename T, typename... Ts> Res exec0(int idx, T arg, Ts... args) {
     int res = bind(idx, arg);
     if (res != 0) throw SqlError(res, db);
     return exec0(idx, args...);
   }
-  template<typename... Ts> SqlResult operator() (Ts... args) {prepare(); return exec0(1, args...);}
+  template<typename... Ts> Res operator() (Ts... args) {prepare(); return exec0(1, args...);}
 
   template<typename... Ts> void get(Ts & ... args) {
     operator()();
-    auto res = SqlResult(db, inf->stmt);
+    auto res = Res(db, inf->stmt);
     if (!res.step()) throw SqlError(std::string("Query did not return any result: ") + inf->sql);
     res.get(args...);
   }

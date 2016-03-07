@@ -52,8 +52,13 @@ using std::vector;
 #endif
 
 #include "sqlite3.hpp"
-#include "queries-gen.hpp"
 #include "json.hpp"
+
+typedef int64_t FileId;
+typedef int64_t ContentId;
+enum OpenState {Closed, OpenedRO, OpenedRW};
+#include "queries-gen.hpp"
+
 
 //////////////////////////////////////////////////////////////////////////////
 //
@@ -78,8 +83,6 @@ pthread_mutex_t db_mutex = PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP;
 sqlite3 * db = NULL;
 std::vector<SqlStmtBase *> sql_stmts;
 
-typedef int64_t FileId;
-typedef int64_t ContentId;
 // FileID == -1 if local, < -1 if proc file
 std::vector<FileId> opened_files;
 std::vector<const char *> proc_file_content;
@@ -387,46 +390,6 @@ struct MayRemove {
 // Misc helper bits
 //
 
-const char * fileinfo_sql = 
-  "drop table if exists fileinfo; "
-  "create table fileinfo ("
-  "  fid integer not null primary key, /* an abstract inode */"
-  "  dir text, /* full path of dir */"
-  "  name text /* file name */,"
-  "  writable boolean,"
-  "  local boolean, /* stored locally */"
-  "  atime int,"
-  "  mtime int,"
-  "  opened int not null default(0), /* 0: Closed, 1: OpenedRO, 2: OpenedRW */"
-  "  open_count int not null default(0),"
-  "  cid integer, /* not defined when opened == OpenedRW */"
-  "  keep_local bool default (0),"
-  "  remote_cid integer, /* null = not uploaded yet */"
-  "  remote_id string, "
-  "  remote_path text,"
-  "  remote_failures int default (0), /* used for prioritizing */"
-  "  downloading boolean default (0), "
-  "  unique(dir,name), "
-  "  unique(remote_path) "
-  ");"
-  "drop table if exists contentinfo; "
-  "create table contentinfo ("
-  "  cid integer not null primary key, /* content id */"
-  "  checksum text,"
-  "  size int"
-  ");"
-  "drop table if exists in_progress; "
-  "create table in_progress ("
-  "  fid integer not null primary key, "
-  "  action string, "
-  "  new_cid integer, "
-  "  new_path integer "
-  ");"
-  "insert into contentinfo (cid) values (10000);" // for debugging to make sure we don't get fid and cid mixed up
-;
-
-enum OpenState {Closed, OpenedRO, OpenedRW};
-
 void init_db(const char * dir, bool reset_db);
 void close_db();
 
@@ -680,7 +643,6 @@ int syncfs_unlink(const char *path)
 // both path and newpath are fs-relative
 auto sql_exists = SQL("select fid from fileinfo where dir=? and name=?");
 auto sql_rename = SQL("update fileinfo set dir=?, name=?, writable=? where dir=? and name=?");
-auto sql_getfiles = SQL("select fid,dir,name from fileinfo where dir is not null");
 //bool fdb_rename(const char *path, const char *newpath, DbMutex &);
 int syncfs_rename(const char *path, const char *newpath)
 {
@@ -718,20 +680,17 @@ int syncfs_rename(const char *path, const char *newpath)
     } else {
       // we have a directory
       // rename each path individually
-      auto res = sql_getfiles();
+      auto res = SELECT("select dir,name from fileinfo where dir is not null");
       auto orig_len = strlen(path);
       std::string newp;
       while (res.step()) {
-	FileId fid;
-	const char * dir, *name;
-	res.get(fid,dir,name);
-	if (strncmp(dir, path, orig_len) != 0) continue;
+	if (strncmp(res->dir, path, orig_len) != 0) continue;
 	newp = newpath;
-	newp += dir + orig_len;
-	newp += name;
+	newp += res->dir + orig_len;
+	newp += res->name;
 	//printf("=== %s%s => %s\n", dir,name, newp.c_str());
 	sql_unlink.exec_nocheck(Path(newp.c_str()));
-	sql_rename.exec1(Path(newp.c_str()), path_writable(newp.c_str()), dir, name);
+	sql_rename.exec1(Path(newp.c_str()), path_writable(newp.c_str()), res->dir, res->name);
 	local = true;
       }
     }
@@ -762,32 +721,26 @@ int syncfs_rename(const char *path, const char *newpath)
  * which will be passed to all file operations.
  *
  */
-auto sql_open_file = SQL("update fileinfo set opened=max(?1,opened),open_count=open_count + 1 where fid=?2");
-auto sql_create = SQL("insert into fileinfo (dir, name, local, mtime, atime, opened, open_count, writable) values (?1,?2,1,?3,?3,2,1,?4)");
-auto sql_mark_dirty = SQL("update fileinfo set cid=NULL where fid=?"); 
-// ^ dirty = file being modified and should be be uploaed until closed
+
 auto sql_get_open_count = SQL("select open_count,opened from fileinfo where fid=?");
 auto sql_close_file = SQL("update fileinfo set open_count = open_count -1, atime=? where fid=?");
 auto sql_release_file = SQL("update fileinfo set opened=0, open_count = 0, atime=? where fid=?");
-auto sql_new_cid = SQL("insert into contentinfo (size) values (?)");
 auto sql_update_info = SQL("update fileinfo set cid=?,mtime=? where fid=?");
 
 FileId fdb_open(const char * path, OpenState open_state) {
   FileId fid;
   sql_get_fid(Path(path)).get(fid);
-  sql_open_file.exec1(open_state, fid);
+  EXEC("update fileinfo set opened=max($open_state,opened),open_count=open_count + 1 where fid=$fid");
   return fid;
 }
 FileId fdb_create(const char * path) {
-  sql_create.exec1(Path(path),time(NULL),path_writable(path));
-  return sqlite3_last_insert_rowid(db);
-  
+  return SQL("insert into fileinfo (dir, name, local, mtime, atime, opened, open_count, writable)"
+	     "values (?1,?2,1,?3,?3,2,1,?4)").exec1(Path(path),time(NULL),path_writable(path));
 }
 
 void update_file_after_mod(FileId fid, ssize_t size, time_t mtime) {
-  sql_new_cid.exec(size);
-  auto cid = sqlite3_last_insert_rowid(db);
-  sql_update_info.exec1(cid, mtime, fid);
+  auto cid = EXEC("insert into contentinfo (size) values ($size)");
+  EXEC("update fileinfo set cid=$cid,mtime=$mtime where fid=$fid");
 }
 
 int fdb_close(FileId fid, int fd, bool cleanup = false) {
@@ -802,6 +755,7 @@ int fdb_close(FileId fid, int fd, bool cleanup = false) {
 	update_file_after_mod(fid, st.st_size, st.st_mtime);
       }
     } else {
+      
       sql_close_file.exec1(time(NULL), fid);
     }
     return 0;
@@ -863,7 +817,8 @@ int syncfs_open(const char *path, struct fuse_file_info *fi)
     log_msg("    fd = %d\n", fd);
 
     if (fid != -1 && !readonly)
-      sql_mark_dirty.exec1(fid);
+      // mark the file as being modified and should be be uploaded until closed
+      EXEC("update fileinfo set cid=NULL where fid=$fid");
 
   } catch (SqlError & err) {
     log_msg("    ERROR: sql error: open %s: %s\n", path, err.msg.c_str());
@@ -1025,12 +980,13 @@ int syncfs_getattr(const char *path, struct stat *statbuf)
 }
 
 // returns -1 on error, 0 if result, 1 if no result
-auto sql_getattr = SQL("select writable,size,atime,mtime from fileinfo join contentinfo using (cid) where dir=? and name=? and opened < 2");
 int fdb_getattr(const char * path, struct stat *statbuf) {
   if (local_only(path)) return 2;
   try {
     DbMutex lock;
-    auto res = sql_getattr(Path(path));
+    auto res = SQL("select writable,size,atime,mtime "
+		   "from fileinfo join contentinfo using (cid) "
+		   "where dir=? and name=? and opened < 2")(Path(path));
     if (res.step()) {
       bool writable;
       res.get(writable, statbuf->st_size, statbuf->st_atime, statbuf->st_mtime);
@@ -1132,11 +1088,10 @@ int syncfs_readdir(const char * path, void *buf, fuse_fill_dir_t filler, off_t o
   return retstat;
 }
 
-auto sql_readdir = SQL("select name from fileinfo where dir=?||'/'");
 void fdb_readdir(const char * dir, void * buf, fuse_fill_dir_t filler) {
   DbMutex lock;
   try {
-    auto names = sql_readdir(strcmp(dir,"/")==0 ? "" : dir);
+    auto names = SQL("select name from fileinfo where dir=?||'/'")(strcmp(dir,"/")==0 ? "" : dir);
     while (names.step()) {
       const char * name;
       names.get(name);
@@ -1325,24 +1280,6 @@ int fetch_path(const char * fpath, FileId fid, DbMutex & lock) {
 // Background tasks
 //
 
-
-const char * uploader_views =
-  "drop view if exists want_to_remove;"
-  "create view want_to_remove as "
-  "  select fid,dir||name as path,atime,mtime,size,coalesce(cid = remote_cid,0) as may_remove from fileinfo join contentinfo using (cid) "
-  "  where local and opened=0 and not keep_local; "
-  "drop view if exists pending;"
-  "create view pending as"
-  "  select fid, "
-  "    dir is null and remote_path is not null as to_delete, "
-  "    dir is not null and checksum is not null and (remote_cid is null or cid != remote_cid) as to_upload, "
-  "    coalesce(dir||name != remote_path,0) as to_rename, "
-  "    (select fid from fileinfo where fid != f.fid and f.dir||f.name = remote_path) as blocked_by, "
-  "    size, "
-  "    case when dir is null then 0 else size end - case when remote_path is null then 0 else r_size end as size_delta "
-  "  from fileinfo f left join contentinfo using (cid) left join (select cid as remote_cid, size as r_size from contentinfo) using (remote_cid); "
-  ;
-
 auto sql_same_content = SQL("select 1 from fileinfo where fid = ? and cid = ?");
 static inline bool same_content(FileId fid, ContentId cid) {
   auto res = sql_same_content(fid,cid);
@@ -1351,8 +1288,6 @@ static inline bool same_content(FileId fid, ContentId cid) {
 }
 
 auto sql_need_checksum = SQL("select fid from fileinfo join contentinfo using (cid) where checksum is null");
-auto sql_checksum_check = SQL("select cid,dir||name as path from fileinfo join contentinfo using (cid) where fid = ? and checksum is null");
-auto sql_set_checksum = SQL("update contentinfo set checksum=? where cid = ?");
 auto sql_want_to_remove = SQL("select * from want_to_remove order by round(size/1024/1024) desc, mtime");
 auto sql_mark_removed = SQL("update fileinfo set local=0 where fid=?");
 auto sql_mark_never_remove = SQL("update fileinfo set keep_local=1 where fid=?");
@@ -1442,7 +1377,8 @@ bool LocalPartThread::do_work() {
   res.reset();
   for (auto fid : need_checksum) {
     if (exiting) throw Exit();
-    auto res = sql_checksum_check(fid);
+    auto res = SELECT("cid,dir||name as path from fileinfo join contentinfo using (cid) "
+		      "where fid = $fid and checksum is null");
     if (!res.step()) continue;
     ContentId cid;
     std::string path;
@@ -1465,7 +1401,9 @@ bool LocalPartThread::do_work() {
       log_msg("*** ERROR: checksum failed on path: %s; exiting\n", fpath);
       exit(-1);
     }
-    sql_set_checksum.exec1(checksum.hex, cid);
+    SQL("update contentinfo set checksum=? where cid = ?")
+      .exec1(checksum.hex, cid);
+    //EXEC("update contentinfo set checksum=${checksum.hex} where cid = $cid");
   }
   uploader_thread->notify();
   if (extra_uploader_thread)
@@ -1820,15 +1758,6 @@ int pending_release(fuse_file_info *fi) {
 static void fail(const char * format, ...);
 enum PopulateAction {DefaultAction, SyncToRemote, SyncToLocal, EmptyTrash};
 
-const char * sql_sync_schema = 
-  "drop table if exists local; "
-  "create table local ( "
-  "  dir text, name text, size int, atime int, mtime int "
-  ");"
-  "drop table if exists remote; "
-  "create table remote ( "
-  "  id text, path text, size int, mtime int, checksum text "
-  ");";
 auto sql_insert_local = SQL("insert into local values (?,?,?,?,?)");
 auto sql_insert_remote = SQL("insert into remote values (?,?,?,?,?)");
 
@@ -1867,7 +1796,7 @@ void remote_listing_callback(void *, const char * id, const char * path, int siz
 int mkpath(const char * orig_path);
 
 void create_missing_dirs() {
-  auto res = SqlSelect("select distinct dir from fileinfo where dir is not null")();
+  auto res = SELECT("distinct dir from fileinfo where dir is not null");
   while (res.step()) {
     const char * dir;
     res.get(dir);
@@ -1878,23 +1807,19 @@ void create_missing_dirs() {
 }
 
 class InsertFromRemote {
-  SqlStmt insert_fileinfo, insert_contentinfo, update_fileinfo;
 public:
-  InsertFromRemote() 
-    : insert_fileinfo("insert into fileinfo (dir,name,writable,atime,mtime,remote_id,remote_path,local) values(?1,?2,?3,?4,?4,?5,?6,0)"),
-      insert_contentinfo("insert into contentinfo (size,checksum) values (?,?)"),
-      update_fileinfo("update fileinfo set cid = ?1, remote_cid = ?1 where fid = ?2") {}
   void operator() (const char * id, const char * path, int size, time_t mtime, const char * checksum) {
-    insert_fileinfo.exec1(Path(path), path_writable(path), mtime, id, path);
-    FileId fid = sqlite3_last_insert_rowid(db);
-    insert_contentinfo.exec1(size, checksum);
-    ContentId cid = sqlite3_last_insert_rowid(db);
-    update_fileinfo.exec1(cid,fid);
+    auto fid = SQL("insert into fileinfo "
+		   "(dir,name,writable,atime,mtime,remote_id,remote_path,local) "
+		   "values(?1,?2,?3,?4,?4,?5,?6,0)")
+      .exec1(Path(path), path_writable(path), mtime, id, path);
+    auto cid = EXEC("insert into contentinfo (size,checksum) values ($size,$checksum)");
+    EXEC("update fileinfo set cid = $cid, remote_cid = $cid where fid = $fid");
   }
 };
 
 void populate_from_remote(SqlTrans & trans) {
-  auto res = SqlSelect("select id,path,size,mtime,checksum from remote")();
+  auto res = SELECT("id,path,size,mtime,checksum from remote");
   InsertFromRemote insert;
   while (res.step()) {
     const char *remote_id, *path;
@@ -1904,7 +1829,7 @@ void populate_from_remote(SqlTrans & trans) {
     res.get(remote_id, path,size,mtime, checksum);
     insert(remote_id, path,size,mtime, checksum);
   }
-  res = SqlSelect("select dir,name,atime from local")();
+  res = SELECT("dir,name,atime from local");
   auto set_local = SQL("update fileinfo set local=1,atime=? where dir=? and name=?");
   while (res.step()) {
     const char * dir, * name;
@@ -1916,19 +1841,20 @@ void populate_from_remote(SqlTrans & trans) {
 }
 
 void populate_from_local(SqlTrans & trans) {
-  auto res = SqlSelect("select dir||name as path,size,atime,mtime from local")();
-  auto insert_fileinfo = SqlStmt("insert into fileinfo (dir,name,writable,size,atime,mtime,local) values (?,?,?,?,?,?,1)");
+  auto res = SELECT("dir||name as path,size,atime,mtime from local");
   while (res.step()) {
     const char * path;
     int size;
     time_t atime,mtime;
     res.get(path,size,atime,mtime);
-    insert_fileinfo.exec1(Path(path),path_writable(path),size,atime,mtime);
+    abort(); // FIXME: This query is broken
+    //SQL("insert into fileinfo (dir,name,writable,size,atime,mtime,local) values (?,?,?,?,?,?,1)")
+    //  .exec1(Path(path),path_writable(path),size,atime,mtime);
   }
 }
 
 void cleanup_local() {
-  auto res = SqlSelect("select fid,dir||name as path,l.size, l.atime, l.mtime, opened, downloading "
+  auto res = SQL("select fid,dir||name as path,l.size, l.atime, l.mtime, opened, downloading "
                        "from local l join fileinfo f using (dir,name) "
                        "where opened > 0 or downloading ")();
   auto clear_downloading = SQL("update fileinfo set opened = 0, downloading = 0 where fid = ?");
@@ -1959,10 +1885,10 @@ void cleanup_local() {
 
 int verify_local() {
   int errors = 0;
-  auto res = SqlSelect("select dir||name as path,fid,l.size != f.size diff, l.mtime as l_mtime, f.mtime as f_mtime "
-                       "from local l left join (fileinfo join contentinfo using (cid)) f using (dir,name) "
-                       "where l.mtime != f.mtime or l.size != f.size or f.fid is null " 
-                       "order by dir,name")();
+  auto res = SQL("select dir||name as path,fid,l.size != f.size diff, l.mtime as l_mtime, f.mtime as f_mtime "
+		 "from local l left join (fileinfo join contentinfo using (cid)) f using (dir,name) "
+		 "where l.mtime != f.mtime or l.size != f.size or f.fid is null " 
+		 "order by dir,name")();
   while (res.step()) {
     const char * path;
     FileId fid;
@@ -1993,10 +1919,10 @@ int verify_local() {
 void sync_local_soft() {
   create_missing_dirs();
   SqlTrans trans;
-  auto res = SqlSelect("select *"
-                       "from (select fid,local,l.dir is not null as l_local "
-                       "      from fileinfo as f left join local as l using (dir,name)) "
-                       "where local != l_local")();
+  auto res = SQL("select *"
+		 "from (select fid,local,l.dir is not null as l_local "
+		 "      from fileinfo as f left join local as l using (dir,name)) "
+		 "where local != l_local")();
   auto update_local = SQL("update fileinfo set local=? where fid=?");
   while (res.step()) {
     FileId fid;
@@ -2021,7 +1947,7 @@ void sync_to_remote(bool noop, bool verbose) {
   // populate_from_local(trans);
   // sql_exec("insert into contentinfo (remote_path) select path from remote");
 
-  // auto res = SqlSelect("select path,size,mtime,cid "
+  // auto res = SQL("select path,size,mtime,cid "
   //                      "from remote r join contentinfo c on r.path = c.remote_path")();
   
   // auto find = SQL("select fid,size,mtime from fileinfo where dir=? and name = ?");
@@ -2057,7 +1983,7 @@ void sync_to_remote(bool noop, bool verbose) {
   // }
 
   // if (verbose) {
-  //   res = SqlSelect("select dir||name as path from fileinfo where fid not in (select fid from contentinfo where fid is not null)")();
+  //   res = SQL("select dir||name as path from fileinfo where fid not in (select fid from contentinfo where fid is not null)")();
   //   while (res.step()) {
   //     const char * path;
   //     res.get(path);
@@ -2073,22 +1999,10 @@ void sync_to_remote(bool noop, bool verbose) {
   // }
 }
 
-const char * sql_remote_diff = 
-  "create temporary view remote_only as select * from remote where path not in (select remote_path from fileinfo where remote_path is not null); "
-  "create temporary view remote_diff as "
-  "  select fid,cid, path, r.path is not null as in_remote, (r.size != f.size or r.checksum != f.checksum) as diff, r.mtime as r_mtime, f.mtime as f_mtime  "
-  "  from (select fid,cid,remote_path as path, size, mtime, local, checksum from fileinfo join contentinfo using (cid) where remote_path is not null) as f "
-  "  left join remote as r using (path) "
-  "  where r.mtime != f.mtime or r.size != f.size or r.path is null";
-const char * sql_remote_diff_cleanup =
-  "drop view if exists remote_only; "
-  "drop view if exists remote_diff; ";
-
 int verify_remote() {
   //sql_exec(sql_remote_diff_cleanup);
-  sql_exec(sql_remote_diff);
   int errors = 0;
-  auto res = SqlSelect("select path from remote_only")();
+  SqlResult res = SELECT("path from remote_only");
   while (res.step()) {
     const char * path;
     res.get(path);
@@ -2096,7 +2010,7 @@ int verify_remote() {
     errors++;
   }
 
-  res = SqlSelect("select path, in_remote, diff, r_mtime, f_mtime from remote_diff")();
+  res = SELECT("path, in_remote, diff, r_mtime, f_mtime from remote_diff");
   while (res.step()) {
     const char * path;
     bool in_remote,diff;
@@ -2111,7 +2025,6 @@ int verify_remote() {
     }
     errors++;
   }
-  sql_exec(sql_remote_diff_cleanup);
   if (errors != 0) {
     printf("ERROR: Inconsistencies in remote file system.\n");
   }
@@ -2125,35 +2038,31 @@ void sync_to_local(bool noop, bool verbose) {
 
   populate_from_remote(trans);
 
-  auto res = SqlSelect("select dir||name as path, fid, l.size, l.atime, l.mtime "
+  auto res = SQL("select dir||name as path, fid, l.size, l.atime, l.mtime "
                        "from local l left join (fileinfo left join contentinfo using (cid)) f using (dir,name) "
                        "where l.mtime != f.mtime or l.size != f.size or f.fid is null "
                        "order by dir,name")();
   auto redownload = SQL("update fileinfo set local=0, cid=NULL where fid=?");
   while (res.step()) {
-    const char * path;
-    FileId fid;
-    int size;
-    time_t atime, mtime;
-    res.get(path, fid, size, atime, mtime);
-    if (fid == 0) 
-      printf("will remove: %s\n", path);
+    auto & d = res.get();
+    if (d.fid == 0) 
+      printf("will remove: %s\n", d.path);
     else
-      printf("will replace: %s\n", path);
+      printf("will replace: %s\n", d.path);
     if (!noop) {
       char fpath[PATH_MAX];
-      syncfs_fullpath(fpath, path);
+      syncfs_fullpath(fpath, d.path);
       int res = unlink(fpath);
       if (res != 0)
         fail("Could not remove local file: %s", fpath);
-      if (fid != 0) {
-        redownload.exec1(fid);
+      if (d.fid != 0) {
+        redownload.exec1(d.fid);
       }
     }
   }
 
   if (verbose) {
-    res = SqlSelect("select dir||name as path from fileinfo where not local and cid is not null")();
+    auto res = SQL("select dir||name as path from fileinfo where not local and cid is not null")();
     while (res.step()) {
       const char * path;
       res.get(path);
@@ -2360,10 +2269,11 @@ void init_db(const char * dir, bool reset_db) {
     sql_exec("PRAGMA synchronous = NORMAL"); // we can rebuild on an os crash
     bool need_tables;
     SQL("select count(*) ==0 from sqlite_master where name='fileinfo'").get(need_tables);
-    if (need_tables || reset_db)
-      sql_exec(fileinfo_sql);
-    sql_exec(uploader_views);
-    sql_exec(sql_sync_schema);
+    if (reset_db)
+      sql_exec("drop table if exists fileinfo; "
+	       "drop table if exists contentinfo; "
+	       "drop table if exists in_progress; ");
+    sql_exec(SqL_schema);
   } catch (SqlError & err) {
     fprintf(stderr, "ERROR: sqlite3: %s\n", err.msg.c_str());
     exit(-1);

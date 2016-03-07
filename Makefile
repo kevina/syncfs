@@ -7,7 +7,7 @@ SSL=-DUSE_OPENSSL
 syncfs : syncfs.o remote.o drive.o
 	${CXX} ${CXXFLAGS} -o syncfs syncfs.o remote.o drive.o `pkg-config fuse --libs` `curl-config --libs` -lsqlite3
 
-syncfs-gen.cpp: sqlite3-pp sqlite3-pp.pl syncfs.cpp
+syncfs-gen.cpp: sqlite3-pp sqlite3-pp.pl syncfs.cpp syncfs.sql
 	./sqlite3-pp.pl
 
 syncfs.o : syncfs-gen.cpp params.h remote.h sqlite3.hpp json.hpp

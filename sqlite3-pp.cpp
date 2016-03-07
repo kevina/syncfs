@@ -68,7 +68,11 @@ struct Main {
       } else if (asc_isalpha(*p)) {
 	auto id = get_id(p);
 	if (id == "SQL") {
-	  p = handle_sql(p);
+	  p = handle_sql(p, "SQL");
+	} else if (id == "EXEC") {
+	  p = handle_sql(p, "EXEC");
+	} else if (id == "SELECT") {
+	  p = handle_sql(p, "SELECT");
 	} else {
 	  p = id.end;
 	}
@@ -109,10 +113,10 @@ struct Main {
     return {begin, p};
   }
 
-  char * handle_sql(char * p) {
+  char * handle_sql(char * p, const char * what) {
     vector<SubStr> parts;
     char * begin = p;
-    p += 3;
+    p += strlen(what);
     p = skip_whitespace(p);
     expect(p, '(');
     ++p;
@@ -131,7 +135,7 @@ struct Main {
     expect(p, ')');
     ++p;
     char * end = p;
-    proc_sql({begin, end}, std::move(parts), query_len);
+    proc_sql({begin, end}, std::move(parts), query_len, what);
     return p;
   }
 
@@ -140,7 +144,7 @@ struct Main {
     assert(*p == c);
   }
 
-  void proc_sql(SubStr, vector<SubStr>&&, size_t);
+  void proc_sql(SubStr, vector<SubStr>&&, size_t, const char * what);
 };
 
 int sql_num = 0;
@@ -155,12 +159,13 @@ struct ProcSql {
   struct Column {
     string name;
     string type;
+    bool last;
   };
   vector<Column> columns;
-  bool is_select;
+  const char * what;
 
-  ProcSql(SubStr orig, vector<SubStr> && pts, size_t sz) 
-    : orig_text(orig), parts(std::move(pts)), splice_count(0), is_select(false)
+  ProcSql(SubStr orig, vector<SubStr> && pts, size_t sz, const char * w) 
+    : orig_text(orig), parts(std::move(pts)), splice_count(0), what(w)
   {
     itr = parts.begin();
     p = itr->begin;
@@ -169,18 +174,28 @@ struct ProcSql {
   void main() {
     clear_orig();
     string id;
-    get_id(id);
-    if (eq_icase(id, "select")) {
-      is_select = true;
+    try_id(id);
+    bool what_eq_select = strcmp(what, "SELECT")==0;
+    bool id_eq_select = eq_icase(id, "select");
+    if (what_eq_select || id_eq_select) {
+      if (id_eq_select) get_id(id);
+      else query += "select ";
       proc_select();
       proc_rest();
     } else {
+      get_id(id);
       proc_rest();
     }
+    cout << what << " ";
+    if (splice_count > 0) 
+      cout << "$=" << splice_count << ' ';
     cout << query << "\n";
     cout << "@ ";
     for (auto & col : columns) {
-      cout << col.name;
+      if (col.name.empty())
+	cout << "-";
+      else
+	cout << col.name;
       if (!col.type.empty())
 	cout << '`' << col.type;
       cout << ' ';
@@ -188,7 +203,7 @@ struct ProcSql {
     cout << "\n";
     p = orig_text.begin;
     char buf[16];
-    auto res = is_select ? snprintf(buf, 16, "SqL%d(", sql_num++) : snprintf(buf, 16, "SqL(%d", sql_num++);
+    auto res = snprintf(buf, 16, "SqL%d(", sql_num++);
     //int newlines = 0
     for (int i = 0; i < res; ++i) {
       assert(asc_isspace(p[i]));
@@ -198,43 +213,87 @@ struct ProcSql {
     orig_text.end[-1] = ')';
   }
 
-  void proc_select() {
-    string id,type;
-    skipspace();
+  struct Token {
+    enum Type {OTHER, ID, AS, TYPE, COMMA, FROM} type;
+    string id;
+  };
+  Token get_token() {
+    Token ret {Token::OTHER};
+    auto & id = ret.id;
+    if (asc_isalpha(*p)) {
+      get_id(id);
+      if (eq_icase(id, "as")) {
+	if (!asc_isalpha(*p)) return ret;
+	get_id(id);
+	ret.type = Token::AS;
+      } else if (eq_icase(id, "from")) {
+	ret.type = Token::FROM;
+      } else {
+	// skip over table names
+	while (p != NULL && *p == '.') {
+	  adv(); skipspace();
+	  if (!asc_isalpha(*p)) return ret;
+	  get_id(id);
+	}
+	ret.type = Token::ID;
+      }
+    } else if (*p == ',') {
+      adv(); skipspace();
+      ret.type = Token::COMMA;
+    } else if (*p == '`') {
+      adv(); skipspace();
+      if (!asc_isalpha(*p)) return ret;
+      get_id(ret.id);
+      ret.type = Token::TYPE;
+    } else if (proc_special()) {
+      /* nothing to do */
+    } else {
+      adv(); skipspace();
+    }
+    return ret;
+  }
+
+  Column get_column() {
+    string id;
+    string type;
     while (p != NULL) {
-      if (proc_special()) {
-	/* nothing to do */
-      } else if (*p == ',') {
-	columns.push_back({id,type});
+      auto tok = get_token();
+      switch (tok.type) {
+      case Token::OTHER: 
 	id.clear();
 	type.clear();
-	adv();
-      } else if (asc_isalpha(*p)) {
-	string id0,type0;
-	get_id_w_type(id0,type0);
-	if (eq_icase(id0, "from")) {
-	  columns.push_back({id,type});
-	  return;
-	} else {
-	  id.swap(id0);
-	  type.swap(type0);
-	}
-      } else {
-	adv();
+	break;
+      case Token::ID:
+      case Token::AS:
+	id = tok.id;
+	break;
+      case Token::TYPE:
+	type = tok.id;
+	break;
+      case Token::COMMA:
+	return {id, type, false};
+      case Token::FROM: 
+	return {id, type, true};
       }
     }
-    skipspace();
+    return {id, type, true};
+  }
+
+  void proc_select() {
+    while (p != NULL) {
+      auto res = get_column();
+      columns.push_back(res);
+      if (res.last) break;
+    }
   }
 
   void proc_rest() {
-    skipspace();
     while (p != NULL) {
       if (proc_special()) {
 	/* nothing to do */
       } else {
 	adv();
       }
-      skipspace();
     }
   }
 
@@ -261,12 +320,14 @@ struct ProcSql {
       bool res = proc_special();
       if (!res) adv();
     }
+    skipspace();
   }
 
   void proc_single_quote() {
     adv();
     while (p != NULL && *p != '\'')
       adv();
+    skipspace();
   }
 
   void clear_orig() {
@@ -284,26 +345,20 @@ struct ProcSql {
     }
   }
   
+  void try_id(string & res) {
+    char * begin = this->p;
+    char * p = this->p;
+    while (asc_isalpha(*p) || asc_isdigit(*p)) ++p;
+    res.assign(begin,p);
+  }
+
   void get_id(string & res) {
     char * begin = p;
     while (asc_isalpha(*p) || asc_isdigit(*p)) ++p;
     query.append(begin, p);
     res.assign(begin,p);
     blank(begin, p);
-  }
-
-  void get_id_w_type(string & id, string & type) {
-    get_id(id);
-    // the type part does not become part of the query
-    if (*p == '`') {
-      *p = ' ';
-      ++p;
-      char * begin = p;
-      while (asc_isalpha(*p) && asc_isdigit(*p)) ++p;
-      adv0();
-      type.assign(begin,p);
-      blank(begin, p);
-    }
+    skipspace();
   }
 
   void adv0() {
@@ -340,8 +395,8 @@ struct ProcSql {
 
 };
 
-void Main::proc_sql(SubStr orig, vector<SubStr>&& p, size_t sz) {
-  ProcSql proc_sql(orig,std::move(p), sz);
+void Main::proc_sql(SubStr orig, vector<SubStr>&& p, size_t sz, const char * what) {
+  ProcSql proc_sql(orig,std::move(p), sz, what);
   proc_sql.main();
 }
 
