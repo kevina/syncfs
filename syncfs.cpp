@@ -1443,6 +1443,7 @@ bool MetadataThread::do_work(DbMutex &lock) {
 OpRes do_delete(FileId fid, int & more_to_do, time_t now, DbMutex & lock) {
   //printf(">delete?> %lli\n", fid);
   lock.lock();
+  if (exiting) throw Exit();
   auto res = SELECT("coalesce(remote_id,remote_path),size_delta,action is not null as in_progress "
 		    "from pending join fileinfo using (fid) left join in_progress using (fid) "
 		    "where to_delete and fid = $fid");
@@ -1463,6 +1464,7 @@ OpRes do_delete(FileId fid, int & more_to_do, time_t now, DbMutex & lock) {
 bool do_rename(FileId fid, int & more_to_do, time_t now, DbMutex & lock) { 
   //printf(">rename?> %lli\n", cid);
   lock.lock();
+  if (exiting) throw Exit();
   auto res = SELECT("remote_id,remote_path, dir||name as path,mtime,blocked_by,action is not null as in_progress "
 		    "from pending join fileinfo f using (fid) left join in_progress using (fid) "
 		    "where to_rename and fid = $fid");
@@ -1495,6 +1497,7 @@ auto sql_mark_bad_upload = SQL("update fileinfo set remote_cid = NULL, remote_pa
 OpRes do_upload(FileId fid, int & more_to_do, time_t now, DbMutex & lock) {
   //printf(">upload?> %lli\n",  cid);
   lock.lock();
+  if (exiting) throw Exit();
   auto res = SELECT("cid,remote_id,remote_path,dir||name as path,mtime,atime,l.size,checksum,blocked_by,size_delta,action is not null as in_progress "
 		    "from pending join fileinfo using (fid) join contentinfo l using (cid) left join in_progress using (fid) "
 		    "where to_upload and fid = $fid");
