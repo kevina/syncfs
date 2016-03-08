@@ -54,28 +54,39 @@ while (<F>) {
 
     my $res_t = "SqlResult";
 
-    my $fields;
+    my @fields;
     if ($base eq 'SqlSelect<>' && @cols) {
 	foreach my $col (@cols) {
 	    my $typ;
 	    if ($col =~ s/\`(.+)$//) {$typ = $1;}
 	    else {$typ = $type_map{$col};}
 	    if (defined $typ) {
-		$fields .= "$typ $col; ";
+		push @fields, [$typ,$col];
 	    } else {
 		$no_type{$col}++;
-		undef $fields;
+		undef @fields;
 		last;
 	    }
 	}
     }
-    if (defined $fields) {
-	my $typ = "SqL${idx}Cols";
-	my $str = "struct $typ {$fields};\n";
-	$str .= "class SqL${idx}Result : public SqlResult {\n";
+    if (@fields > 0) {
+	my $typ;
+	my $str;
+	if (@fields == 1) {
+	    $typ = "SqL${idx}ResT";
+	    $str = "typedef $fields[0][0] SqL${idx}ResT;\n";
+	} else {
+	    my $fields = join('', map {$_->[0].' '.$_->[1].'; '} @fields);
+	    $typ = "SqL${idx}Cols";
+	    $str = "struct $typ {$fields};\n";
+	}
+	$str .= "struct SqL${idx}Result : public SqlResult {\n";
 	$str .= "  $typ res;\n";
-	$str .= "  void populate() {get(".join(',', map {"res.$_"} @cols)."); step_called = 1;}\n";
-	$str .= "public:\n";
+	if (@fields == 1) {
+	    $str .= "  void populate() {get(res); step_called = 1;}\n";
+	} else {
+	    $str .= "  void populate() {get(".join(',', map {"res.$_"} @cols)."); step_called = 1;}\n";
+	}
 	$str .= "  SqL${idx}Result() : SqlResult() {}\n";
 	$str .= "  SqL${idx}Result(sqlite3 * db, sqlite3_stmt * stmt) : SqlResult(db, stmt) {}\n";
 	$str .= "  SqL${idx}Result(SqL${idx}Result && other) : SqlResult(std::move(other)) {}\n";
@@ -83,7 +94,16 @@ while (<F>) {
 	$str .= "  using SqlResult::get;\n";
 	$str .= "  const $typ & get() {if (step_called == 0) step(); if (step_called == 2) populate(); return res;}\n";
 	$str .= "  const $typ & operator*() {if (step_called == 0) step(); if (step_called == 2) populate(); return res;}\n";
-	$str .= "  const $typ * operator->() {if (step_called == 0) step(); if (step_called == 2) populate(); return &res;}\n";
+	if (@fields > 1) {
+	    $str .= "  const $typ * operator->() {if (step_called == 0) step(); if (step_called == 2) populate(); return &res;}\n";
+	}
+	$str .= "  typedef $typ Value;\n";
+	$str .= "  typedef SqLIter<SqL${idx}Result> Iterator;\n";
+	$str .= "  Iterator begin() {return Iterator(this);}\n";
+	$str .= "  Iterator end() {return Iterator(NULL);}\n";
+	#if (true) {
+	#    $str .= "  std::vector<Value> get_all() {std::vector<Value> ret; while(step()) {populate(); ret.push_back(std::move(res));} return ret;}\n";
+	#}
 	$str .= "};\n";
 	push @rest, $str;
 	$res_t = "SqL${idx}Result";
@@ -118,7 +138,10 @@ while (<F>) {
 
 open O, ">queries-gen.hpp\n";
 
-print O "#include <array>\n";
+print O <<'---';
+#include <array>
+---
+
 print O "std::array<SqlStmtInfo,$idx> SqL_queries{{\n";
 print O "  ";
 print O join(",\n  ", @array);

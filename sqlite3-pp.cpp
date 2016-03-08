@@ -220,7 +220,7 @@ struct ProcSql {
   Token get_token() {
     Token ret {Token::OTHER};
     auto & id = ret.id;
-    if (asc_isalpha(*p)) {
+    if (asc_isalpha(*p) || *p == '*') {
       get_id(id);
       if (eq_icase(id, "as")) {
 	if (!asc_isalpha(*p)) return ret;
@@ -232,7 +232,7 @@ struct ProcSql {
 	// skip over table names
 	while (p != NULL && *p == '.') {
 	  adv(); skipspace();
-	  if (!asc_isalpha(*p)) return ret;
+	  if (!(asc_isalpha(*p) || *p == '*')) return ret;
 	  get_id(id);
 	}
 	ret.type = Token::ID;
@@ -241,9 +241,9 @@ struct ProcSql {
       adv(); skipspace();
       ret.type = Token::COMMA;
     } else if (*p == '`') {
-      adv(); skipspace();
+      adv(false); skipspace(false);
       if (!asc_isalpha(*p)) return ret;
-      get_id(ret.id);
+      get_id(ret.id, false);
       ret.type = Token::TYPE;
     } else if (proc_special()) {
       /* nothing to do */
@@ -305,12 +305,12 @@ struct ProcSql {
     return true;
   }
 
-  void skipspace() {
+  void skipspace(bool output = true) {
   again:
     if (p == NULL) return;
-    if (asc_isspace(*p)) {adv(); goto again;}
-    if (p[0] == '-' && p[1] == '-') {adv(); adv(); while (p != NULL && *p != '\n') adv(); goto again;}
-    if (p[0] == '/' && p[1] == '*') {adv(); adv(); while (p != NULL && !(p[0] == '*' && p[1] == '/')) adv(); goto again;}
+    if (asc_isspace(*p)) {adv(output); goto again;}
+    if (p[0] == '-' && p[1] == '-') {adv(output); adv(output); while (p != NULL && *p != '\n') adv(output); goto again;}
+    if (p[0] == '/' && p[1] == '*') {adv(output); adv(output); while (p != NULL && !(p[0] == '*' && p[1] == '/')) adv(output); goto again;}
   }
 
   void proc_group(char close) {
@@ -327,6 +327,7 @@ struct ProcSql {
     adv();
     while (p != NULL && *p != '\'')
       adv();
+    adv();
     skipspace();
   }
 
@@ -348,16 +349,21 @@ struct ProcSql {
   void try_id(string & res) {
     char * begin = this->p;
     char * p = this->p;
-    while (asc_isalpha(*p) || asc_isdigit(*p)) ++p;
+    while (p && (asc_isalpha(*p) || asc_isdigit(*p))) ++p;
     res.assign(begin,p);
   }
 
-  void get_id(string & res) {
+  void get_id(string & res, bool output = true) {
     char * begin = p;
-    while (asc_isalpha(*p) || asc_isdigit(*p)) ++p;
-    query.append(begin, p);
+    if (*p == '*') {
+      ++p;
+    } else {
+      while (asc_isalpha(*p) || asc_isdigit(*p)) ++p;
+    }
+    if (output) query.append(begin, p);
     res.assign(begin,p);
     blank(begin, p);
+    adv0();
     skipspace();
   }
 
@@ -373,8 +379,8 @@ struct ProcSql {
     }
   }
 
-  void adv() {
-    query += *p;
+  void adv(bool output = true) {
+    if (output) query += *p;
     *p = ' ';
     ++p;
     adv0();
@@ -388,8 +394,13 @@ struct ProcSql {
       *p = ' ';
     splice_count++;
     ++p;
-    while (asc_isalpha(*p) || asc_isdigit(*p))
-      ++p;
+    for (;;) {
+      if (asc_isalpha(*p) || asc_isdigit(*p)) ++p;
+      else if (*p == '.') ++p;
+      else if (p[0] == ':' && p[1] == ':') p += 2;
+      else if (p[0] == '-' && p[1] == '>') p += 2;
+      else break;
+    }
     adv0();
   }
 

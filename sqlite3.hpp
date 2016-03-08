@@ -74,6 +74,7 @@ protected:
     if (res != 0) return res;
     return sqlite3_bind_text(inf->stmt, idx++, pos, -1,  SQLITE_STATIC);
   }
+  int bind(int & idx, const string & val) {return sqlite3_bind_text(inf->stmt, idx++, val.c_str(), -1, SQLITE_TRANSIENT);};
 };
 
 class SqlStmt : public SqlStmtBase {
@@ -205,6 +206,7 @@ class SqlSelect : public SqlStmtBase {
 public:
   SqlSelect(const char * sql) : SqlStmtBase(sql) {}
   SqlSelect(SqlStmtInfo * i) : SqlStmtBase(i) {}
+
   Res exec0(int) {
     return Res(db, inf->stmt);
   }
@@ -257,3 +259,18 @@ public:
   }
 };
 
+template <typename T>
+struct SqLIter {
+  T * val;
+  typedef typename T::Value value_type;
+  SqLIter(T * v) : val(v) {if (val) operator++();}
+  const value_type & operator*() const {return val->res;}
+  const value_type * operator->() const {return &val->res;}
+  SqLIter & operator++() {bool res = val->step(); if (!res) val = NULL; else val->populate(); return *this;}
+  void operator++(int) {bool res = val->step(); if (!res) val = NULL; else val->populate();}
+};
+
+template <typename T>
+static inline bool operator==(SqLIter<T> x, SqLIter<T> y) {return x.val == y.val;}
+template <typename T>
+static inline bool operator!=(SqLIter<T> x, SqLIter<T> y) {return x.val != y.val;}
