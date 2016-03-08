@@ -126,12 +126,11 @@ protected:
   bool more_to_do_now;
   int more_to_do;
   int error_backoff;
-  DbMutex lock;
-  virtual bool do_work() = 0; // returns true if the function should
-			      // be called again without waiting
+  virtual bool do_work(DbMutex &lock) = 0; // returns true if the function should
+			                    // be called again without waiting
   Worker(const char * name) 
     : worker_name(name), cond(PTHREAD_COND_INITIALIZER), 
-      waiting (false), more_to_do_now(false), more_to_do(), error_backoff(), lock(false) {}
+      waiting (false), more_to_do_now(false), more_to_do(), error_backoff() {}
 
 public:
   void create() {
@@ -146,7 +145,7 @@ class LocalPartThread : public Worker {
 public:
   LocalPartThread() : Worker("local part thread") {}
 protected:
-  bool do_work();
+  bool do_work(DbMutex &lock);
 } * local_part_thread = NULL;
 
 // The cleanup thread removes files locally that are no longer needed
@@ -156,7 +155,7 @@ class UploaderThread : public Worker {
 public:
   UploaderThread() : Worker("uploader thread") {}
 protected:
-  bool do_work();
+  bool do_work(DbMutex &lock);
 } * uploader_thread =  NULL;
 
 // The extra_uploader thread is an optional thread that uploads files
@@ -165,7 +164,7 @@ class ExtraUploaderThread : public Worker {
 public:
   ExtraUploaderThread() : Worker("extra uploader thread") {}
 protected:
-  bool do_work();
+  bool do_work(DbMutex &lock);
 } * extra_uploader_thread =  NULL;
 
 // The metadata thread pushes other changes not handled by other threads
@@ -173,7 +172,7 @@ class MetadataThread : public Worker {
 public:
   MetadataThread() : Worker("metadata thread") {}
 protected:
-  bool do_work();
+  bool do_work(DbMutex &lock);
 } * metadata_thread = NULL;
 
 void log_msg(const char *format, ...)
@@ -1297,7 +1296,7 @@ OpRes do_upload(FileId fid, int & more_to_do, time_t now, DbMutex & lock);
 
 vector<FileId> want_to_remove;
 
-bool LocalPartThread::do_work() {
+bool LocalPartThread::do_work(DbMutex &lock) {
   assert(lock.locked);
   time_t now = time(NULL);
   // Delete any local files that are already upload and can be removed
@@ -1364,7 +1363,7 @@ bool LocalPartThread::do_work() {
   return false;
 }
 
-bool UploaderThread::do_work() {
+bool UploaderThread::do_work(DbMutex &lock) {
   assert(lock.locked);
   time_t now = time(NULL);
   vector<FileId> want_to_remove = ::want_to_remove;
@@ -1397,7 +1396,7 @@ bool UploaderThread::do_work() {
   return false;
 }
 
-bool ExtraUploaderThread::do_work() {
+bool ExtraUploaderThread::do_work(DbMutex &lock) {
   assert(lock.locked);
   time_t now = time(NULL);
   vector<FileId> to_upload;
@@ -1414,7 +1413,7 @@ bool ExtraUploaderThread::do_work() {
   return false;
 }
 
-bool MetadataThread::do_work() {
+bool MetadataThread::do_work(DbMutex &lock) {
   assert(lock.locked);
   time_t now = time(NULL);
   vector<FileId> to_delete;
@@ -1555,7 +1554,7 @@ OpRes do_upload(FileId fid, int & more_to_do, time_t now, DbMutex & lock) {
 
 void * Worker::start() {
   log_msg("*** %s: starting\n", worker_name);
-  lock.lock();
+  DbMutex lock;
   more_to_do = INT_MAX;
   error_backoff = MIN_BACKOFF_ERROR;
  loop: try {
@@ -1564,7 +1563,7 @@ void * Worker::start() {
     more_to_do_now = false;
     if (exiting) throw Exit();
 
-    bool again = do_work();
+    bool again = do_work(lock);
     lock.lock(); // make sure we are still locked
 
     if (exiting) throw Exit();
