@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/xattr.h>
+#include <signal.h>
 
 #include <stdarg.h>
 #include <assert.h>
@@ -1351,9 +1352,12 @@ bool LocalPartThread::do_work(DbMutex &lock) {
       // all good, let's continue
     if (ret != 0) {
       // this should not happen and if does we can't really continue
-      // so just exit
-      log_msg("*** ERROR: checksum failed on path: %s; exiting\n", fpath);
-      exit(-1);
+      // so just exit, do so be sending a SIGTERM so we can exit
+      // cleanly and give the worker threads a chance to end at a good
+      // point
+      log_msg("*** FATAL: checksum failed on path: %s; exiting\n", fpath);
+      kill(getpid(), SIGTERM);
+      throw Exit();
     }
     EXEC("update contentinfo set checksum=$checksum.hex where cid = $cid");
   }
@@ -1599,9 +1603,9 @@ void * Worker::start() {
   } catch (Exit) {
     goto exit;
   } catch (SqlError & err) {
-    log_msg("FATAL: %s: sqlite3: %s\n", worker_name, err.msg.c_str());
-    log_msg("Exiting.\n");
-    exit(-1);
+    log_msg("*** FATAL: %s: sqlite3: %s\n", worker_name, err.msg.c_str());
+    kill(getpid(), SIGTERM);
+    goto exit;
   }
   goto loop;
  exit:
