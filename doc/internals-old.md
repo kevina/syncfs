@@ -1,3 +1,7 @@
+Note: This document described the internals as of version 0.001.  It
+is now already out of data.  As SyncFS is alpha software the internal
+workings will likely change many times.  The Sqlite3 schema is now in
+the file `synfs.sql`.
 
 # Schema
 
