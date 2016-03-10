@@ -1793,9 +1793,10 @@ void populate_from_local(SqlTrans & trans) {
     int size;
     time_t atime,mtime;
     res.get(path,size,atime,mtime);
-    abort(); // FIXME: This query is broken
-    //SQL("insert into fileinfo (dir,name,writable,size,atime,mtime,local) values (?,?,?,?,?,?,1)")
-    //  .exec1(Path(path),path_writable(path),size,atime,mtime);
+    auto fid = SQL("insert into fileinfo (dir,name,writable,atime,mtime,local) values (?,?,?,?,?,1)")
+      .exec1(Path(path),path_writable(path),atime,mtime);
+    auto cid = EXEC("insert into contentinfo (size) values ($size)");
+    EXEC("update fileinfo set cid = $cid where fid = $fid");
   }
 }
 
@@ -1886,63 +1887,39 @@ void sync_local_soft() {
 }
 
 void sync_to_remote(bool noop, bool verbose) {
-  abort();
-  // SqlTrans trans;
-  // sql_exec("delete from fileinfo");
-  // sql_exec("delete from contentinfo");
-  // populate_from_local(trans);
-  // sql_exec("insert into contentinfo (remote_path) select path from remote");
+  SqlTrans trans;
+  sql_exec("delete from fileinfo");
+  sql_exec("delete from contentinfo");
+  populate_from_local(trans);
 
-  // auto res = SQL("select path,size,mtime,cid "
-  //                      "from remote r join contentinfo c on r.path = c.remote_path")();
-  
-  // auto find = SQL("select fid,size,mtime from fileinfo where dir=? and name = ?");
-  // auto link_fileinfo = SQL("update fileinfo set cid=? where fid=?");
-  // auto link_contentinfo = SQL("update contentinfo set fid=? where cid=?");
-  // auto deleted_link = SQL("insert into fileinfo (size,mtime) values (?,?)");
+  for (auto & r : SELECT("path,size,mtime,checksum,id`cstr from remote")) {
+    auto cid = EXEC("insert into contentinfo (size,checksum) values ($r.size,$r.checksum)");
+    auto l = SQL("select fid,mtime,size from fileinfo join contentinfo using (cid) where dir = ? and name = ?")(Path(r.path));
+    if (l.step()) {
+      EXEC("update fileinfo set remote_cid = $cid, remote_id = $r.id, remote_path = $r.path where fid = $l->fid");
+      if (r.size == l->size && r.mtime == l->mtime)
+	// we are assuming the content is the same so link up the cid
+	EXEC("update fileinfo set cid = $cid where fid = $l->fid");
+      else
+	// since the cid differ a new version will be uploaded
+	printf("will overright: %s\n", r.path);
+    } else {
+      printf("will delete: %s\n", r.path);
+      EXEC("insert into fileinfo (remote_id,remote_path,remote_cid) values ($r.id,$r.path,$cid)");
+    }
+  }
 
-  // while (res.step()) {
-  //   const char * path;
-  //   int size,f_size;
-  //   time_t mtime,f_mtime;
-  //   ContentId cid;
-  //   FileId fid;
-  //   res.get(path, size, mtime, cid);
-  //   auto found = find(Path(path));
-  //   if (found.step()) {
-  //     found.get(fid,f_size,f_mtime);
-  //     if (size == f_size && mtime == f_mtime) { // all okay link them up
-  //       link_fileinfo.exec1(cid,fid);
-  //       link_contentinfo.exec1(fid,cid);
-  //     } else { 
-  //       printf("will overright: %s\n", path);
-  //       // since the fileinfo has no link to the content will
-  //       // automatically upload a new version to the remote
-  //       link_contentinfo.exec1(fid,cid);
-  //     }
-  //   } else {
-  //     printf("will delete: %s\n", path);
-  //     deleted_link.exec1(Path(path));
-  //     fid = sqlite3_last_insert_rowid(db);
-  //     link_contentinfo.exec1(fid,cid);
-  //   }
-  // }
+  if (verbose) {
+    for (auto path : SELECT("select dir||name as path from fileinfo where remote_cid is null"))
+      printf("marked to upload: %s\n", path);
+  }
 
-  // if (verbose) {
-  //   res = SQL("select dir||name as path from fileinfo where fid not in (select fid from contentinfo where fid is not null)")();
-  //   while (res.step()) {
-  //     const char * path;
-  //     res.get(path);
-  //     printf("marked to upload: %s\n", path);
-  //   }
-  // }
-
-  // if (noop) {
-  //   trans.rollback();
-  //   printf("NOT PERFORMING SYNC.  RESTORING TO PREVIOUS STATE.\n");
-  // } else {
-  //   trans.commit();
-  // }
+  if (noop) {
+    trans.rollback();
+    printf("NOT PERFORMING SYNC.  RESTORING TO PREVIOUS STATE.\n");
+  } else {
+    trans.commit();
+  }
 }
 
 int verify_remote() {

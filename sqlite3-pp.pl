@@ -6,6 +6,7 @@ use warnings;
 my %type_map = (
     'fid' => 'FileId',
     'cid' => 'ContentId',
+    'remote_cid' => 'ContentId',
     'dir' => 'const char *',
     'name' => 'const char *',
     'path' => 'const char *',
@@ -61,6 +62,8 @@ while (<F>) {
 	    if ($col =~ s/\`(.+)$//) {$typ = $1;}
 	    else {$typ = $type_map{$col};}
 	    if (defined $typ) {
+		$typ = 'const char *' if $typ eq 'cstr';
+		$typ = 'std::string'  if $typ eq 'string';
 		push @fields, [$typ,$col];
 	    } else {
 		$no_type{$col}++;

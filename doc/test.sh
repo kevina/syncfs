@@ -7,6 +7,8 @@
 set -e
 set -x
 
+cp data/.etc/syncfs.conf.for-backup data/.etc/syncfs.conf
+
 fusermount -uz ./backup || true
 sleep 1
 ./syncfs data backup
@@ -88,6 +90,39 @@ then
   fusermount -u ./backup
   exit 1
 fi
+
+fusermount -u ./backup
+
+sleep 1;
+
+echo "TESTING SYNC TO REMOTE"
+
+cp data/.etc/syncfs.conf.keep-all data/.etc/syncfs.conf
+
+./syncfs data backup
+
+find backup/* -type f | xargs cat > /dev/null
+
+fusermount -u ./backup
+
+rm data/index/*
+echo ' junk' >> data/backups/backup-3 
+echo 'content' > data/backups/afile.txt
+
+./syncfs --sync-to-remote-for-real data backup
+
+sleep 5
+while pending=`cat /aux/backup/k/backup/.proc/pending`
+      test -n "$pending"
+do echo "SyncFS Still Busy..."
+   sleep 5
+done
+
+fusermount -u ./backup
+
+./syncfs data backup
+
+sleep 1
 
 fusermount -u ./backup
 
