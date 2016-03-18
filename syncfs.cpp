@@ -1379,6 +1379,7 @@ bool UploaderThread::do_work(DbMutex &lock) {
       lock.lock();
       local_part_thread->notify();
       error_backoff = MIN_BACKOFF_ERROR;
+      metadata_thread->notify();
       return true;
     }
   }
@@ -1392,7 +1393,9 @@ bool UploaderThread::do_work(DbMutex &lock) {
   for (auto fid : to_upload) {
     auto res = do_upload(fid, more_to_do, now, lock);
     if (res.did_something) {
+      lock.lock();
       error_backoff = MIN_BACKOFF_ERROR;
+      metadata_thread->notify();
       return true;
     }
   }
@@ -1411,7 +1414,9 @@ bool ExtraUploaderThread::do_work(DbMutex &lock) {
   for (auto fid : to_upload) {
     auto res = do_upload(fid, more_to_do, now, lock);
     if (res.did_something) {
+      lock.lock();
       error_backoff = MIN_BACKOFF_ERROR;
+      metadata_thread->notify();
     }
   }
   return false;
